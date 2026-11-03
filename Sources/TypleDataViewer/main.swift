@@ -1,8 +1,28 @@
 import AppKit
 
+struct FruitRow {
+    let number: Int
+    let fruit: String
+    let count: Int
+}
+
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
     private var window: NSWindow!
+
+    private let rows: [FruitRow] = [
+        FruitRow(number: 1, fruit: "りんご", count: 2),
+        FruitRow(number: 2, fruit: "バナナ", count: 4),
+        FruitRow(number: 3, fruit: "オレンジ", count: 4),
+    ]
+
+    private enum Column: String, CaseIterable {
+        case number = "番号"
+        case fruit = "果物"
+        case count = "個数"
+
+        var identifier: NSUserInterfaceItemIdentifier { NSUserInterfaceItemIdentifier(rawValue) }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         window = NSWindow(
@@ -13,17 +33,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         window.title = "Typle Data Viewer"
 
-        let label = NSTextField(labelWithString: "Hello, World")
-        label.font = .systemFont(ofSize: 32, weight: .semibold)
-        label.translatesAutoresizingMaskIntoConstraints = false
+        let tableView = NSTableView()
+        tableView.usesAlternatingRowBackgroundColors = true
+        for column in Column.allCases {
+            let tableColumn = NSTableColumn(identifier: column.identifier)
+            tableColumn.title = column.rawValue
+            tableColumn.width = column == .fruit ? 200 : 100
+            tableView.addTableColumn(tableColumn)
+        }
+        tableView.dataSource = self
+        tableView.delegate = self
 
-        let contentView = NSView()
-        contentView.addSubview(label)
-        NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
-        ])
-        window.contentView = contentView
+        let scrollView = NSScrollView()
+        scrollView.documentView = tableView
+        scrollView.hasVerticalScroller = true
+        window.contentView = scrollView
 
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -32,6 +56,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    // MARK: - NSTableViewDataSource
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        rows.count
+    }
+
+    // MARK: - NSTableViewDelegate
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard let tableColumn, let column = Column(rawValue: tableColumn.identifier.rawValue) else { return nil }
+
+        let item = rows[row]
+        let text: String
+        switch column {
+        case .number: text = String(item.number)
+        case .fruit: text = item.fruit
+        case .count: text = String(item.count)
+        }
+
+        let cell = tableView.makeView(withIdentifier: tableColumn.identifier, owner: self) as? NSTextField
+            ?? {
+                let field = NSTextField(labelWithString: "")
+                field.identifier = tableColumn.identifier
+                return field
+            }()
+        cell.stringValue = text
+        cell.alignment = column == .fruit ? .left : .right
+        return cell
     }
 }
 
