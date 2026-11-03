@@ -10,7 +10,7 @@ struct FruitRow {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
     private var window: NSWindow!
 
-    private let rows: [FruitRow] = [
+    private var rows: [FruitRow] = [
         FruitRow(number: 1, fruit: "りんご", count: 2),
         FruitRow(number: 2, fruit: "バナナ", count: 4),
         FruitRow(number: 3, fruit: "オレンジ", count: 4),
@@ -39,6 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             let tableColumn = NSTableColumn(identifier: column.identifier)
             tableColumn.title = column.rawValue
             tableColumn.width = column == .fruit ? 200 : 100
+            tableColumn.sortDescriptorPrototype = NSSortDescriptor(key: column.rawValue, ascending: true)
             tableView.addTableColumn(tableColumn)
         }
         tableView.dataSource = self
@@ -62,6 +63,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     func numberOfRows(in tableView: NSTableView) -> Int {
         rows.count
+    }
+
+    func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
+        guard let descriptor = tableView.sortDescriptors.first,
+              let key = descriptor.key,
+              let column = Column(rawValue: key) else { return }
+
+        rows.sort { lhs, rhs in
+            let order: ComparisonResult
+            switch column {
+            case .number: order = compare(lhs.number, rhs.number)
+            case .fruit: order = lhs.fruit.localizedStandardCompare(rhs.fruit)
+            case .count: order = compare(lhs.count, rhs.count)
+            }
+            // 値が同じ場合は番号順で並びを安定させる
+            if order == .orderedSame { return lhs.number < rhs.number }
+            return descriptor.ascending ? order == .orderedAscending : order == .orderedDescending
+        }
+        tableView.reloadData()
+    }
+
+    private func compare(_ lhs: Int, _ rhs: Int) -> ComparisonResult {
+        lhs < rhs ? .orderedAscending : lhs > rhs ? .orderedDescending : .orderedSame
     }
 
     // MARK: - NSTableViewDelegate
