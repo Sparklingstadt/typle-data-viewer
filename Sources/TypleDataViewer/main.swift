@@ -155,6 +155,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         tableView.usesAlternatingRowBackgroundColors = true
         tableView.dataSource = self
         tableView.delegate = self
+        tableView.target = self
+        tableView.doubleAction = #selector(tableViewDoubleClicked(_:))
         rebuildColumns()
 
         let scrollView = NSScrollView()
@@ -418,6 +420,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         case (nil, _): .orderedAscending
         case (_, nil): .orderedDescending
         case let (lhs?, rhs?): lhs.localizedStandardCompare(rhs)
+        }
+    }
+
+    // MARK: - Cell values
+
+    /// セルをダブルクリックしたら、その値を別ウインドウで全文表示する
+    @objc private func tableViewDoubleClicked(_ sender: NSTableView) {
+        let row = sender.clickedRow
+        let columnIndex = sender.clickedColumn
+        // 見出しや空白部分のダブルクリックは -1 になる
+        guard row >= 0, sender.tableColumns.indices.contains(columnIndex) else { return }
+        let tableColumn = sender.tableColumns[columnIndex]
+        guard let value = cellValue(row: row, identifier: tableColumn.identifier) else { return }
+
+        var title = tableColumn.title
+        if databaseColumns != nil, tables.indices.contains(tablePopUp.indexOfSelectedItem) {
+            title = "\(tables[tablePopUp.indexOfSelectedItem].displayName).\(title)"
+        }
+        title += language == .japanese ? "（\(row + 1)行目）" : " (row \(row + 1))"
+        ValueWindowController.show(title: title, value: value)
+    }
+
+    /// 表に出している値。外側が nil なら該当するセルがない、内側が nil なら DB の NULL
+    private func cellValue(row: Int, identifier: NSUserInterfaceItemIdentifier) -> String?? {
+        if databaseColumns != nil {
+            guard let index = Int(identifier.rawValue.dropFirst(Self.databaseColumnPrefix.count)),
+                  databaseRows.indices.contains(row),
+                  databaseRows[row].values.indices.contains(index) else { return nil }
+            return .some(databaseRows[row].values[index])
+        }
+
+        guard let column = Column(rawValue: identifier.rawValue), rows.indices.contains(row) else { return nil }
+        let item = rows[row]
+        switch column {
+        case .number: return String(item.number)
+        case .fruit: return item.fruit(in: language)
+        case .count: return String(item.count)
         }
     }
 
