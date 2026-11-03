@@ -85,6 +85,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     /// 表示中の DB テーブル。nil のときはサンプルの果物データを表示する
     private var databaseColumns: [String]?
     private var databaseRows: [DatabaseRow] = []
+    /// 列の入れ替え中は、古い列のまま新しいデータで描画しないよう再描画を止める
+    private var isRebuildingColumns = false
 
     private var rows: [FruitRow] = [
         FruitRow(number: 1, fruitJapanese: "りんご", fruitEnglish: "Apple", count: 2),
@@ -327,6 +329,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     // MARK: - Columns and sorting
 
     private func rebuildColumns() {
+        isRebuildingColumns = true
+        defer { isRebuildingColumns = false }
         // 列が入れ替わるので、前の列のソート指定は外す
         tableView.sortDescriptors = []
         for tableColumn in tableView.tableColumns {
@@ -379,7 +383,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard let descriptor = tableView.sortDescriptors.first, let key = descriptor.key else { return }
 
         if databaseColumns != nil {
-            guard let index = Int(key.dropFirst(Self.databaseColumnPrefix.count)) else { return }
+            guard let index = Int(key.dropFirst(Self.databaseColumnPrefix.count)),
+                  index < databaseColumns?.count ?? 0 else { return }
             databaseRows.sort { lhs, rhs in
                 let order = compare(lhs.values[index], rhs.values[index])
                 if order == .orderedSame { return lhs.order < rhs.order }
@@ -423,6 +428,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
+        guard !isRebuildingColumns else { return }
         sortRows()
         tableView.reloadData()
     }
@@ -442,7 +448,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         if databaseColumns != nil {
             let key = tableColumn.identifier.rawValue
-            guard let index = Int(key.dropFirst(Self.databaseColumnPrefix.count)) else { return nil }
+            guard let index = Int(key.dropFirst(Self.databaseColumnPrefix.count)),
+                  databaseRows.indices.contains(row),
+                  databaseRows[row].values.indices.contains(index) else { return nil }
             let value = databaseRows[row].values[index]
             cell.stringValue = value ?? "NULL"
             cell.textColor = value == nil ? .tertiaryLabelColor : .labelColor
