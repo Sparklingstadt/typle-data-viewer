@@ -6,7 +6,22 @@ enum DatabaseError: Error {
     case invalidURL
 }
 
+struct TableName: Hashable, Sendable {
+    let schema: String
+    let name: String
+
+    var displayName: String { schema == "public" ? name : "\(schema).\(name)" }
+}
+
+struct TableData: Sendable {
+    let columns: [String]
+    let rows: [[String?]]
+}
+
 enum Database {
+    /// 大きなテーブルでも固まらないよう、表示する行数の上限
+    static let rowLimit = 1000
+
     private static let logger = Logger(label: "typle-data-viewer.database")
 
     /// Neon の接続文字列（postgresql://user:password@host/db?sslmode=require）を
@@ -55,5 +70,52 @@ enum Database {
             return version
         }
         return "?"
+    }
+
+    static func listTables(on connection: PostgresConnection) async throws -> [TableName] {
+        let rows = try await connection.query(
+            """
+            SELECT table_schema, table_name FROM information_schema.tables
+            WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema')
+            ORDER BY table_schema, table_name
+            """,
+            logger: logger
+        )
+        var tables: [TableName] = []
+        for try await (schema, name) in rows.decode((String, String).self) {
+            tables.append(TableName(schema: schema, name: name))
+        }
+        return tables
+    }
+
+    static func fetchTable(_ table: TableName, on connection: PostgresConnection) async throws -> TableData {
+        let columnRows = try await connection.query(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = \(table.schema) AND table_name = \(table.name)
+            ORDER BY ordinal_position
+            """,
+            logger: logger
+        )
+        var columns: [String] = []
+        for try await column in columnRows.decode(String.self) {
+            columns.append(column)
+        }
+        guard !columns.isEmpty else { return TableData(columns: [], rows: []) }
+
+        // 型ごとのデコードを避けるため、全列をサーバー側で text に変換して受け取る
+        let selectList = columns.map { "\(quoteIdentifier($0))::text" }.joined(separator: ", ")
+        let source = "\(quoteIdentifier(table.schema)).\(quoteIdentifier(table.name))"
+        let query = PostgresQuery(unsafeSQL: "SELECT \(selectList) FROM \(source) LIMIT \(rowLimit)")
+
+        var rows: [[String?]] = []
+        for try await row in try await connection.query(query, logger: logger) {
+            rows.append(try row.map { try $0.decode(String?.self) })
+        }
+        return TableData(columns: columns, rows: rows)
+    }
+
+    private static func quoteIdentifier(_ identifier: String) -> String {
+        "\"" + identifier.replacingOccurrences(of: "\"", with: "\"\"") + "\""
     }
 }

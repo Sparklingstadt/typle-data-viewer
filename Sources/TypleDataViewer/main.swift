@@ -61,10 +61,17 @@ struct FruitRow {
     }
 }
 
+/// DB から読んだ1行。ソート後も同値の行を元の順に並べるため、取得時の順番を持つ
+struct DatabaseRow {
+    let order: Int
+    let values: [String?]
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
     private var window: NSWindow!
     private var tableView: NSTableView!
+    private var tablePopUp: NSPopUpButton!
     private var connectButton: NSButton!
     private var statusLabel: NSTextField!
     private var language: Language = .japanese
@@ -72,6 +79,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var connectionState: ConnectionState = .disconnected {
         didSet { updateConnectionUI() }
     }
+
+    /// 接続中は DB のテーブル一覧、未接続時は空
+    private var tables: [TableName] = []
+    /// 表示中の DB テーブル。nil のときはサンプルの果物データを表示する
+    private var databaseColumns: [String]?
+    private var databaseRows: [DatabaseRow] = []
 
     private var rows: [FruitRow] = [
         FruitRow(number: 1, fruitJapanese: "りんご", fruitEnglish: "Apple", count: 2),
@@ -98,9 +111,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
 
+    private static let databaseColumnPrefix = "db."
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 300),
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 420),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -117,6 +132,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let titleLabel = NSTextField(labelWithString: "データ")
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
 
+        tablePopUp = NSPopUpButton()
+        tablePopUp.target = self
+        tablePopUp.action = #selector(tableSelectionDidChange(_:))
+        tablePopUp.isHidden = true
+        tablePopUp.translatesAutoresizingMaskIntoConstraints = false
+
         connectButton = NSButton(title: "", target: self, action: #selector(connectButtonClicked(_:)))
         connectButton.bezelStyle = .push
         connectButton.translatesAutoresizingMaskIntoConstraints = false
@@ -130,23 +151,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         tableView = NSTableView()
         tableView.usesAlternatingRowBackgroundColors = true
-        for column in Column.allCases {
-            let tableColumn = NSTableColumn(identifier: column.identifier)
-            tableColumn.width = column == .fruit ? 200 : 100
-            tableColumn.sortDescriptorPrototype = NSSortDescriptor(key: column.rawValue, ascending: true)
-            tableView.addTableColumn(tableColumn)
-        }
         tableView.dataSource = self
         tableView.delegate = self
-        updateColumnTitles()
+        rebuildColumns()
 
         let scrollView = NSScrollView()
         scrollView.documentView = tableView
         scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = true
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
         let contentView = NSView()
         contentView.addSubview(titleLabel)
+        contentView.addSubview(tablePopUp)
         contentView.addSubview(statusLabel)
         contentView.addSubview(connectButton)
         contentView.addSubview(languagePopUp)
@@ -160,10 +177,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
             statusLabel.centerYAnchor.constraint(equalTo: languagePopUp.centerYAnchor),
             statusLabel.trailingAnchor.constraint(equalTo: connectButton.leadingAnchor, constant: -8),
-            statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 12),
+            statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: tablePopUp.trailingAnchor, constant: 12),
 
             titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
             titleLabel.centerYAnchor.constraint(equalTo: languagePopUp.centerYAnchor),
+
+            tablePopUp.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 8),
+            tablePopUp.centerYAnchor.constraint(equalTo: languagePopUp.centerYAnchor),
 
             scrollView.topAnchor.constraint(equalTo: languagePopUp.bottomAnchor, constant: 12),
             scrollView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
@@ -186,6 +206,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let _: EventLoopFuture<Void>? = connection?.close()
     }
 
+    // MARK: - Connection
+
     @objc private func connectButtonClicked(_ sender: NSButton) {
         if case .connected = connectionState {
             disconnect()
@@ -200,14 +222,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             do {
                 let connection = try await Database.connect()
                 let version: String
+                let tables: [TableName]
                 do {
                     version = try await Database.serverVersion(of: connection)
+                    tables = try await Database.listTables(on: connection)
                 } catch {
                     try? await connection.close()
                     throw error
                 }
                 self.connection = connection
+                self.tables = tables
                 connectionState = .connected(serverVersion: version)
+                updateTablePopUp()
+                if let first = tables.first {
+                    loadTable(first)
+                }
             } catch {
                 connectionState = .failed(error)
             }
@@ -217,7 +246,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func disconnect() {
         guard let connection else { return }
         self.connection = nil
+        tables = []
         connectionState = .disconnected
+        updateTablePopUp()
+        showSampleData()
         Task { try? await connection.close() }
     }
 
@@ -238,13 +270,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
 
+    // MARK: - Database tables
+
+    private func updateTablePopUp() {
+        let selected = tablePopUp.indexOfSelectedItem
+        tablePopUp.removeAllItems()
+        tablePopUp.isHidden = connection == nil
+        if tables.isEmpty {
+            tablePopUp.addItem(withTitle: language == .japanese ? "テーブルがありません" : "No tables")
+            tablePopUp.isEnabled = false
+        } else {
+            tablePopUp.addItems(withTitles: tables.map(\.displayName))
+            tablePopUp.isEnabled = true
+            if tables.indices.contains(selected) {
+                tablePopUp.selectItem(at: selected)
+            }
+        }
+    }
+
+    @objc private func tableSelectionDidChange(_ sender: NSPopUpButton) {
+        guard tables.indices.contains(sender.indexOfSelectedItem) else { return }
+        loadTable(tables[sender.indexOfSelectedItem])
+    }
+
+    private func loadTable(_ table: TableName) {
+        guard let connection else { return }
+        Task {
+            do {
+                let data = try await Database.fetchTable(table, on: connection)
+                // 読み込み中に別のテーブルが選ばれていたら、古い結果は捨てる
+                guard self.connection === connection,
+                      tables.indices.contains(tablePopUp.indexOfSelectedItem),
+                      tables[tablePopUp.indexOfSelectedItem] == table else { return }
+                databaseColumns = data.columns
+                databaseRows = data.rows.enumerated().map { DatabaseRow(order: $0.offset, values: $0.element) }
+                rebuildColumns()
+                tableView.reloadData()
+            } catch {
+                let alert = NSAlert()
+                alert.messageText = language == .japanese
+                    ? "テーブル「\(table.displayName)」を読み込めませんでした"
+                    : "Could not load table \"\(table.displayName)\""
+                alert.informativeText = String(reflecting: error)
+                alert.beginSheetModal(for: window, completionHandler: nil)
+            }
+        }
+    }
+
+    private func showSampleData() {
+        databaseColumns = nil
+        databaseRows = []
+        rebuildColumns()
+        tableView.reloadData()
+    }
+
+    // MARK: - Columns and sorting
+
+    private func rebuildColumns() {
+        // 列が入れ替わるので、前の列のソート指定は外す
+        tableView.sortDescriptors = []
+        for tableColumn in tableView.tableColumns {
+            tableView.removeTableColumn(tableColumn)
+        }
+
+        if let databaseColumns {
+            for (index, name) in databaseColumns.enumerated() {
+                let key = Self.databaseColumnPrefix + String(index)
+                let tableColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(key))
+                tableColumn.title = name
+                tableColumn.width = 140
+                tableColumn.sortDescriptorPrototype = NSSortDescriptor(key: key, ascending: true)
+                tableView.addTableColumn(tableColumn)
+            }
+        } else {
+            for column in Column.allCases {
+                let tableColumn = NSTableColumn(identifier: column.identifier)
+                tableColumn.width = column == .fruit ? 200 : 100
+                tableColumn.sortDescriptorPrototype = NSSortDescriptor(key: column.rawValue, ascending: true)
+                tableView.addTableColumn(tableColumn)
+            }
+            updateColumnTitles()
+        }
+    }
+
     @objc private func languageDidChange(_ sender: NSPopUpButton) {
         language = Language.allCases[sender.indexOfSelectedItem]
         updateConnectionUI()
-        updateColumnTitles()
-        // 果物名は言語で並び順が変わるので、現在のソートをかけ直す
-        sortRows()
-        tableView.reloadData()
+        if tables.isEmpty {
+            updateTablePopUp()
+        }
+        if databaseColumns == nil {
+            updateColumnTitles()
+            // 果物名は言語で並び順が変わるので、現在のソートをかけ直す
+            sortRows()
+            tableView.reloadData()
+        }
     }
 
     private func updateColumnTitles() {
@@ -256,10 +376,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func sortRows() {
-        guard let descriptor = tableView.sortDescriptors.first,
-              let key = descriptor.key,
-              let column = Column(rawValue: key) else { return }
+        guard let descriptor = tableView.sortDescriptors.first, let key = descriptor.key else { return }
 
+        if databaseColumns != nil {
+            guard let index = Int(key.dropFirst(Self.databaseColumnPrefix.count)) else { return }
+            databaseRows.sort { lhs, rhs in
+                let order = compare(lhs.values[index], rhs.values[index])
+                if order == .orderedSame { return lhs.order < rhs.order }
+                return descriptor.ascending ? order == .orderedAscending : order == .orderedDescending
+            }
+            return
+        }
+
+        guard let column = Column(rawValue: key) else { return }
         rows.sort { lhs, rhs in
             let order: ComparisonResult
             switch column {
@@ -277,10 +406,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         lhs < rhs ? .orderedAscending : lhs > rhs ? .orderedDescending : .orderedSame
     }
 
+    /// DB の値は text で受け取っているので、数字も数値として並ぶ比較を使う。NULL は先頭
+    private func compare(_ lhs: String?, _ rhs: String?) -> ComparisonResult {
+        switch (lhs, rhs) {
+        case (nil, nil): .orderedSame
+        case (nil, _): .orderedAscending
+        case (_, nil): .orderedDescending
+        case let (lhs?, rhs?): lhs.localizedStandardCompare(rhs)
+        }
+    }
+
     // MARK: - NSTableViewDataSource
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        rows.count
+        databaseColumns == nil ? rows.count : databaseRows.count
     }
 
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
@@ -291,23 +430,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     // MARK: - NSTableViewDelegate
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard let tableColumn, let column = Column(rawValue: tableColumn.identifier.rawValue) else { return nil }
-
-        let item = rows[row]
-        let text: String
-        switch column {
-        case .number: text = String(item.number)
-        case .fruit: text = item.fruit(in: language)
-        case .count: text = String(item.count)
-        }
+        guard let tableColumn else { return nil }
 
         let cell = tableView.makeView(withIdentifier: tableColumn.identifier, owner: self) as? NSTextField
             ?? {
                 let field = NSTextField(labelWithString: "")
                 field.identifier = tableColumn.identifier
+                field.lineBreakMode = .byTruncatingTail
                 return field
             }()
-        cell.stringValue = text
+
+        if databaseColumns != nil {
+            let key = tableColumn.identifier.rawValue
+            guard let index = Int(key.dropFirst(Self.databaseColumnPrefix.count)) else { return nil }
+            let value = databaseRows[row].values[index]
+            cell.stringValue = value ?? "NULL"
+            cell.textColor = value == nil ? .tertiaryLabelColor : .labelColor
+            cell.alignment = .left
+            return cell
+        }
+
+        guard let column = Column(rawValue: tableColumn.identifier.rawValue) else { return nil }
+        let item = rows[row]
+        switch column {
+        case .number: cell.stringValue = String(item.number)
+        case .fruit: cell.stringValue = item.fruit(in: language)
+        case .count: cell.stringValue = String(item.count)
+        }
+        cell.textColor = .labelColor
         cell.alignment = column == .fruit ? .left : .right
         return cell
     }
