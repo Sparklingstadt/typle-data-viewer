@@ -74,6 +74,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         languagePopUp.action = #selector(languageDidChange(_:))
         languagePopUp.translatesAutoresizingMaskIntoConstraints = false
 
+        let titleLabel = NSTextField(labelWithString: "データ")
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+
         tableView = NSTableView()
         tableView.usesAlternatingRowBackgroundColors = true
         for column in Column.allCases {
@@ -92,11 +95,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
         let contentView = NSView()
+        contentView.addSubview(titleLabel)
         contentView.addSubview(languagePopUp)
         contentView.addSubview(scrollView)
         NSLayoutConstraint.activate([
             languagePopUp.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 12),
             languagePopUp.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -12),
+
+            titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
+            titleLabel.centerYAnchor.constraint(equalTo: languagePopUp.centerYAnchor),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: languagePopUp.leadingAnchor, constant: -12),
 
             scrollView.topAnchor.constraint(equalTo: languagePopUp.bottomAnchor, constant: 12),
             scrollView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
