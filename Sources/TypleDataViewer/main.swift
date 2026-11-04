@@ -91,7 +91,8 @@ struct DatabaseRow {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate,
+    NSMenuItemValidation {
     private var window: NSWindow!
     private var tableView: CopyableTableView!
     /// 左側に縦に並べる DB テーブルの一覧
@@ -401,11 +402,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let editMenuItem = NSMenuItem()
         editMenuItem.submenu = editMenu
 
+        // 値のウインドウが前面にあっても、メインの表を読み直す
+        let viewMenu = NSMenu(title: japanese ? "表示" : "View")
+        let reloadItem = viewMenu.addItem(
+            withTitle: japanese ? "再読み込み" : "Reload",
+            action: #selector(reloadMenuItemSelected(_:)),
+            keyEquivalent: "r"
+        )
+        reloadItem.target = self
+        let viewMenuItem = NSMenuItem()
+        viewMenuItem.submenu = viewMenu
+
         let mainMenu = NSMenu()
         mainMenu.addItem(appMenuItem)
         mainMenu.addItem(fileMenuItem)
         mainMenu.addItem(editMenuItem)
+        mainMenu.addItem(viewMenuItem)
         NSApp.mainMenu = mainMenu
+    }
+
+    /// 接続し直さずに、選択中のテーブルをいまの条件（絞り込み・並べ替え・ページ・タブ）のまま読み直す
+    @objc private func reloadMenuItemSelected(_ sender: Any?) {
+        guard let selectedTable else { return }
+        loadTable(selectedTable, keepsScrollPosition: true)
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(reloadMenuItemSelected(_:)) {
+            return connection != nil && selectedTable != nil
+        }
+        return true
     }
 
     // MARK: - Connection
@@ -506,7 +532,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
 
-    private func loadTable(_ table: TableName) {
+    /// - Parameter keepsScrollPosition: 再読み込みのとき、同じテーブル・ページならスクロール位置を保つ
+    private func loadTable(_ table: TableName, keepsScrollPosition: Bool = false) {
         guard let connection else { return }
         let tab = sidebarTab
         if table != queryTable {
@@ -536,6 +563,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 // 読み込み中に別のテーブルやタブ、条件が選ばれていたら、古い結果は捨てる
                 guard generation == loadGeneration, self.connection === connection,
                       selectedTable == table, sidebarTab == tab else { return }
+                // 再読み込みで行が減り、いまのページが範囲外になったら最後のページを読み直す
+                if tab == .data, data.rows.isEmpty, query.offset > 0, totalCount > 0 {
+                    dataQuery.offset = (totalCount - 1) / Database.pageSize * Database.pageSize
+                    loadTable(table)
+                    return
+                }
+                let keepsScroll = keepsScrollPosition && displayedTable == table
+                    && isShowingSchema == (tab == .schema) && displayedOffset == query.offset
+                let scrollOrigin = tableView.enclosingScrollView?.documentVisibleRect.origin
                 // ページ送りや絞り込みでは列が変わらないので、列幅や並べ替えの表示はそのまま残す
                 let columnsChanged = displayedTable != table || isShowingSchema != (tab == .schema)
                     || databaseColumns != data.columns
@@ -547,9 +583,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 databaseRows = data.rows.enumerated().map { DatabaseRow(order: $0.offset, values: $0.element) }
                 if columnsChanged {
                     rebuildColumns()
+                } else if isShowingSchema {
+                    // スキーマは手元で並べているので、見出しの並べ替えを読み直した行にもかけ直す
+                    sortRows()
                 }
                 tableView.reloadData()
-                if !databaseRows.isEmpty {
+                if keepsScroll, let scrollOrigin {
+                    tableView.scroll(scrollOrigin)
+                } else if !databaseRows.isEmpty {
                     tableView.scrollRowToVisible(0)
                 }
                 updateDataControls()
