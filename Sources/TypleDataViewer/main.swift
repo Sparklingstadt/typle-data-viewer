@@ -117,6 +117,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     /// 列の入れ替え中は、古い列のまま新しいデータで描画しないよう再描画を止める
     private var isRebuildingColumns = false
 
+    // データタブの絞り込み・並べ替え・ページ送り。いずれもサーバー側で行う
+    private var filterBar: NSStackView!
+    private var filterColumnPopUp: NSPopUpButton!
+    private var searchField: NSSearchField!
+    private var pagingBar: NSStackView!
+    private var rangeLabel: NSTextField!
+    private var previousPageButton: NSButton!
+    private var nextPageButton: NSButton!
+    /// 次に読むときの条件。表示中の結果とは限らない（読み込み中は先に変わる）
+    private var dataQuery = TableQuery()
+    /// dataQuery がどのテーブルに対するものか。別のテーブルを選んだら条件を初期化する
+    private var queryTable: TableName?
+    /// いま表に出しているテーブル・ページの先頭行・絞り込み後の総件数
+    private var displayedTable: TableName?
+    private var displayedOffset = 0
+    private var totalRowCount = 0
+    /// 読み込みを始めるたびに増やす。追い越された古い結果を捨てるのに使う
+    private var loadGeneration = 0
+
+    private static let countFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter
+    }()
+
     private var rows: [FruitRow] = [
         FruitRow(number: 1, fruitJapanese: "りんご", fruitEnglish: "Apple", count: 2),
         FruitRow(number: 2, fruitJapanese: "バナナ", fruitEnglish: "Banana", count: 4),
@@ -194,6 +219,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         scrollView.hasHorizontalScroller = true
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
+        // 表の上に絞り込み、下にページ送り。DB のデータを出しているときだけ見せる
+        filterColumnPopUp = NSPopUpButton()
+        filterColumnPopUp.target = self
+        filterColumnPopUp.action = #selector(filterDidChange(_:))
+        searchField = NSSearchField()
+        searchField.target = self
+        searchField.action = #selector(filterDidChange(_:))
+        searchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        filterBar = NSStackView(views: [filterColumnPopUp, searchField])
+        filterBar.orientation = .horizontal
+        filterBar.spacing = 8
+        filterBar.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
+
+        rangeLabel = NSTextField(labelWithString: "")
+        rangeLabel.textColor = .secondaryLabelColor
+        rangeLabel.lineBreakMode = .byTruncatingTail
+        rangeLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        previousPageButton = NSButton(title: "", target: self, action: #selector(previousPageClicked(_:)))
+        nextPageButton = NSButton(title: "", target: self, action: #selector(nextPageClicked(_:)))
+        pagingBar = NSStackView()
+        pagingBar.orientation = .horizontal
+        pagingBar.spacing = 8
+        pagingBar.edgeInsets = NSEdgeInsets(top: 6, left: 8, bottom: 6, right: 8)
+        pagingBar.addView(rangeLabel, in: .leading)
+        pagingBar.addView(previousPageButton, in: .trailing)
+        pagingBar.addView(nextPageButton, in: .trailing)
+
+        let dataPane = NSStackView(views: [filterBar, scrollView, pagingBar])
+        dataPane.orientation = .vertical
+        dataPane.alignment = .width
+        dataPane.spacing = 0
+        dataPane.translatesAutoresizingMaskIntoConstraints = false
+        updateDataControls()
+
         tableListView = NSTableView()
         tableListView.style = .sourceList
         tableListView.headerView = nil
@@ -248,7 +307,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         splitView.isVertical = true
         splitView.dividerStyle = .thin
         splitView.addArrangedSubview(sidebar)
-        splitView.addArrangedSubview(scrollView)
+        splitView.addArrangedSubview(dataPane)
         splitView.setHoldingPriority(.defaultLow + 1, forSubviewAt: 0)
         splitView.translatesAutoresizingMaskIntoConstraints = false
 
@@ -278,7 +337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             splitView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
 
             sidebar.widthAnchor.constraint(greaterThanOrEqualToConstant: 140),
-            scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 240),
+            dataPane.widthAnchor.constraint(greaterThanOrEqualToConstant: 240),
         ])
         window.contentView = contentView
         // 区切りの初期位置は、分割ビューの大きさが決まってから設定する
@@ -391,6 +450,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard let connection else { return }
         self.connection = nil
         tables = []
+        queryTable = nil
+        dataQuery = TableQuery()
+        searchField.stringValue = ""
         connectionState = .disconnected
         updateTableList()
         showSampleData()
@@ -447,26 +509,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func loadTable(_ table: TableName) {
         guard let connection else { return }
         let tab = sidebarTab
+        if table != queryTable {
+            // 別のテーブルに移ったら、絞り込み・並べ替え・ページを最初に戻す
+            queryTable = table
+            dataQuery = TableQuery()
+            searchField.stringValue = ""
+        }
+        let query = dataQuery
+        loadGeneration += 1
+        let generation = loadGeneration
         Task {
             do {
                 let data: TableData
+                var totalCount = 0
                 switch tab {
                 case .data:
-                    data = try await Database.fetchTable(table, on: connection)
+                    let page = try await Database.fetchTable(table, query: query, on: connection)
+                    data = TableData(columns: page.columns, rows: page.rows)
+                    totalCount = page.totalCount
                 case .schema:
                     data = TableData(
                         columns: SidebarTab.schemaColumnTitles(in: language),
                         rows: try await Database.fetchSchema(table, on: connection)
                     )
                 }
-                // 読み込み中に別のテーブルやタブが選ばれていたら、古い結果は捨てる
-                guard self.connection === connection, selectedTable == table, sidebarTab == tab else { return }
+                // 読み込み中に別のテーブルやタブ、条件が選ばれていたら、古い結果は捨てる
+                guard generation == loadGeneration, self.connection === connection,
+                      selectedTable == table, sidebarTab == tab else { return }
+                // ページ送りや絞り込みでは列が変わらないので、列幅や並べ替えの表示はそのまま残す
+                let columnsChanged = displayedTable != table || isShowingSchema != (tab == .schema)
+                    || databaseColumns != data.columns
                 isShowingSchema = tab == .schema
+                displayedTable = table
+                displayedOffset = query.offset
+                totalRowCount = totalCount
                 databaseColumns = data.columns
                 databaseRows = data.rows.enumerated().map { DatabaseRow(order: $0.offset, values: $0.element) }
-                rebuildColumns()
+                if columnsChanged {
+                    rebuildColumns()
+                }
                 tableView.reloadData()
+                if !databaseRows.isEmpty {
+                    tableView.scrollRowToVisible(0)
+                }
+                updateDataControls()
             } catch {
+                guard generation == loadGeneration else { return }
                 let alert = NSAlert()
                 alert.messageText = language == .japanese
                     ? "テーブル「\(table.displayName)」を読み込めませんでした"
@@ -477,12 +565,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
 
+    /// 選択中のテーブルを、いまの条件で読み直す
+    private func reloadSelectedTable() {
+        if let selectedTable {
+            loadTable(selectedTable)
+        }
+    }
+
     private func showSampleData() {
         isShowingSchema = false
+        displayedTable = nil
         databaseColumns = nil
         databaseRows = []
         rebuildColumns()
         tableView.reloadData()
+        updateDataControls()
+    }
+
+    // MARK: - Filtering and paging
+
+    /// DB のテーブルの中身を出しているか（スキーマやサンプルではなく）
+    private var isShowingDatabaseData: Bool {
+        databaseColumns != nil && !isShowingSchema
+    }
+
+    /// 絞り込み欄・ページ送り欄の表示と文言を、いまの表示内容に合わせる
+    private func updateDataControls() {
+        let japanese = language == .japanese
+        searchField.placeholderString = japanese ? "検索" : "Search"
+        previousPageButton.title = japanese ? "前へ" : "Previous"
+        nextPageButton.title = japanese ? "次へ" : "Next"
+
+        filterBar.isHidden = !isShowingDatabaseData
+        pagingBar.isHidden = !isShowingDatabaseData
+        guard isShowingDatabaseData, let databaseColumns else { return }
+
+        // 先頭は「すべての列」。列名は項目の representedObject に持たせる
+        filterColumnPopUp.removeAllItems()
+        let allItem = NSMenuItem(title: japanese ? "すべての列" : "All columns", action: nil, keyEquivalent: "")
+        filterColumnPopUp.menu?.addItem(allItem)
+        filterColumnPopUp.menu?.addItem(.separator())
+        for name in databaseColumns {
+            let item = NSMenuItem(title: name, action: nil, keyEquivalent: "")
+            item.representedObject = name
+            filterColumnPopUp.menu?.addItem(item)
+        }
+        let selectedItem = filterColumnPopUp.itemArray.first {
+            ($0.representedObject as? String) == dataQuery.filterColumn
+        }
+        filterColumnPopUp.select(dataQuery.filterColumn == nil ? allItem : selectedItem ?? allItem)
+
+        let shownEnd = displayedOffset + databaseRows.count
+        if totalRowCount == 0 || databaseRows.isEmpty {
+            rangeLabel.stringValue = japanese ? "0 件" : "0 rows"
+        } else {
+            let start = Self.formatCount(displayedOffset + 1)
+            let end = Self.formatCount(shownEnd)
+            let total = Self.formatCount(totalRowCount)
+            rangeLabel.stringValue = japanese
+                ? "\(start)〜\(end) 件目 / 全 \(total) 件"
+                : "\(start)–\(end) of \(total) rows"
+        }
+        previousPageButton.isEnabled = displayedOffset > 0
+        nextPageButton.isEnabled = shownEnd < totalRowCount
+    }
+
+    private static func formatCount(_ count: Int) -> String {
+        countFormatter.string(from: NSNumber(value: count)) ?? String(count)
+    }
+
+    /// 検索語か対象の列が変わったら、先頭のページから読み直す
+    @objc private func filterDidChange(_ sender: Any) {
+        guard isShowingDatabaseData else { return }
+        let column = filterColumnPopUp.selectedItem?.representedObject as? String
+        let text = searchField.stringValue
+        guard text != dataQuery.filterText || column != dataQuery.filterColumn else { return }
+        let needsReload = !(text.isEmpty && dataQuery.filterText.isEmpty)
+        dataQuery.filterColumn = column
+        dataQuery.filterText = text
+        dataQuery.offset = 0
+        // 検索語が空のまま列だけ変えても結果は同じなので、読み直さない
+        if needsReload {
+            reloadSelectedTable()
+        }
+    }
+
+    @objc private func previousPageClicked(_ sender: Any) {
+        guard isShowingDatabaseData, displayedOffset > 0 else { return }
+        dataQuery.offset = max(0, displayedOffset - Database.pageSize)
+        reloadSelectedTable()
+    }
+
+    @objc private func nextPageClicked(_ sender: Any) {
+        guard isShowingDatabaseData, displayedOffset + databaseRows.count < totalRowCount else { return }
+        dataQuery.offset = displayedOffset + Database.pageSize
+        reloadSelectedTable()
     }
 
     // MARK: - Columns and sorting
@@ -504,6 +681,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 tableColumn.width = 140
                 tableColumn.sortDescriptorPrototype = NSSortDescriptor(key: key, ascending: true)
                 tableView.addTableColumn(tableColumn)
+            }
+            // データタブに戻ったときなど、サーバー側でかけている並べ替えを見出しの矢印に反映する
+            if !isShowingSchema, let sortColumn = dataQuery.sortColumn,
+               let index = databaseColumns.firstIndex(of: sortColumn) {
+                let key = Self.databaseColumnPrefix + String(index)
+                tableView.sortDescriptors = [NSSortDescriptor(key: key, ascending: dataQuery.ascending)]
             }
         } else {
             for column in Column.allCases {
@@ -527,6 +710,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if isShowingSchema {
             updateSchemaColumnTitles()
         }
+        updateDataControls()
         if databaseColumns == nil {
             updateColumnTitles()
             // 果物名は言語で並び順が変わるので、現在のソートをかけ直す
@@ -586,7 +770,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         lhs < rhs ? .orderedAscending : lhs > rhs ? .orderedDescending : .orderedSame
     }
 
-    /// DB の値は text で受け取っているので、数字も数値として並ぶ比較を使う。NULL は先頭
+    /// スキーマの表は text で受け取っているので、数字も数値として並ぶ比較を使う。NULL は先頭
     private func compare(_ lhs: String?, _ rhs: String?) -> ComparisonResult {
         switch (lhs, rhs) {
         case (nil, nil): .orderedSame
@@ -611,7 +795,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if databaseColumns != nil, let selectedTable {
             title = "\(selectedTable.displayName).\(title)"
         }
-        title += language == .japanese ? "（\(row + 1)行目）" : " (row \(row + 1))"
+        // ページ送りしているときは、テーブル全体での行番号にする
+        let rowNumber = row + 1 + (isShowingDatabaseData ? displayedOffset : 0)
+        title += language == .japanese ? "（\(rowNumber)行目）" : " (row \(rowNumber))"
         ValueWindowController.show(title: title, value: value, language: language)
     }
 
@@ -642,6 +828,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
         guard tableView === self.tableView, !isRebuildingColumns else { return }
+        // DB のデータは読み込み済みの行だけでなくテーブル全体で並べたいので、ORDER BY を付けて読み直す
+        if isShowingDatabaseData, let databaseColumns {
+            let descriptor = tableView.sortDescriptors.first
+            let index = descriptor?.key.flatMap { Int($0.dropFirst(Self.databaseColumnPrefix.count)) }
+            dataQuery.sortColumn = index.flatMap { databaseColumns.indices.contains($0) ? databaseColumns[$0] : nil }
+            dataQuery.ascending = descriptor?.ascending ?? true
+            dataQuery.offset = 0
+            reloadSelectedTable()
+            return
+        }
         sortRows()
         tableView.reloadData()
     }
