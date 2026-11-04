@@ -103,8 +103,11 @@ enum Database {
         return nil
     }
 
-    static func connect() async throws -> PostgresConnection {
-        guard let urlString = connectionURL() else { throw DatabaseError.missingURL }
+    /// - Parameters:
+    ///   - urlString: 接続 URL。nil なら DATABASE_URL（環境変数か .env）を使う
+    ///   - password: URL にパスワードが書かれていないときに使うパスワード（Keychain から読んだもの）
+    static func connect(urlString: String? = nil, password: String? = nil) async throws -> PostgresConnection {
+        guard let urlString = urlString ?? connectionURL() else { throw DatabaseError.missingURL }
         guard let components = URLComponents(string: urlString),
               let host = components.host,
               let username = components.user else { throw DatabaseError.invalidURL }
@@ -118,7 +121,7 @@ enum Database {
             host: host,
             port: components.port ?? 5432,
             username: username,
-            password: components.password,
+            password: components.password ?? password,
             database: database?.isEmpty == false ? database : nil,
             tls: tls
         )

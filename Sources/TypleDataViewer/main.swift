@@ -118,6 +118,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     /// 右の表にいまスキーマを出しているか。言語を切り替えたときに見出しを付け直すのに使う
     private var isShowingSchema = false
     private var connectButton: NSButton!
+    /// 接続先を選ぶメニュー。DATABASE_URL、保存した接続先、追加・編集・削除の項目を並べる
+    private var connectionPopUp: NSPopUpButton!
+    private var connectionProfiles: [ConnectionProfile] = ConnectionStore.loadProfiles()
+    private var selectedTarget: ConnectionTarget = ConnectionStore.selectedTarget
+    /// いま接続している接続先。列の見た目を接続先ごとに分けて覚えるのに使う
+    private var connectedTarget: ConnectionTarget?
     private var statusLabel: NSTextField!
     private var language: Language = .japanese
     private var connection: PostgresConnection?
@@ -241,6 +247,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         connectButton = NSButton(title: "", target: self, action: #selector(connectButtonClicked(_:)))
         connectButton.bezelStyle = .push
         connectButton.translatesAutoresizingMaskIntoConstraints = false
+
+        connectionPopUp = NSPopUpButton()
+        connectionPopUp.target = self
+        connectionPopUp.action = #selector(connectionPopUpDidChange(_:))
+        connectionPopUp.setContentCompressionResistancePriority(.defaultLow + 1, for: .horizontal)
+        connectionPopUp.translatesAutoresizingMaskIntoConstraints = false
+        rebuildConnectionMenu()
 
         statusLabel = NSTextField(labelWithString: "")
         statusLabel.textColor = .secondaryLabelColor
@@ -430,6 +443,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         contentView.addSubview(titleLabel)
         contentView.addSubview(statusLabel)
         contentView.addSubview(connectButton)
+        contentView.addSubview(connectionPopUp)
         contentView.addSubview(languagePopUp)
         contentView.addSubview(splitView)
         NSLayoutConstraint.activate([
@@ -439,8 +453,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             connectButton.centerYAnchor.constraint(equalTo: languagePopUp.centerYAnchor),
             connectButton.trailingAnchor.constraint(equalTo: languagePopUp.leadingAnchor, constant: -8),
 
+            connectionPopUp.centerYAnchor.constraint(equalTo: languagePopUp.centerYAnchor),
+            connectionPopUp.trailingAnchor.constraint(equalTo: connectButton.leadingAnchor, constant: -8),
+            connectionPopUp.widthAnchor.constraint(lessThanOrEqualToConstant: 220),
+
             statusLabel.centerYAnchor.constraint(equalTo: languagePopUp.centerYAnchor),
-            statusLabel.trailingAnchor.constraint(equalTo: connectButton.leadingAnchor, constant: -8),
+            statusLabel.trailingAnchor.constraint(equalTo: connectionPopUp.leadingAnchor, constant: -8),
             statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 12),
 
             titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
@@ -678,6 +696,171 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         )
     }
 
+    // MARK: - Connection profiles
+
+    /// 接続先メニューの項目を作り直す。representedObject に "target:…" か "action:…" を持たせる
+    private func rebuildConnectionMenu() {
+        let japanese = language == .japanese
+        connectionPopUp.removeAllItems()
+        guard let menu = connectionPopUp.menu else { return }
+
+        let hasEnvironmentURL = Database.connectionURL() != nil
+        let environmentItem = NSMenuItem(
+            title: hasEnvironmentURL ? "DATABASE_URL" : (japanese ? "DATABASE_URL（未設定）" : "DATABASE_URL (not set)"),
+            action: nil,
+            keyEquivalent: ""
+        )
+        environmentItem.representedObject = "target:" + ConnectionTarget.environment.key
+        menu.addItem(environmentItem)
+        for profile in connectionProfiles {
+            let item = NSMenuItem(title: profile.name, action: nil, keyEquivalent: "")
+            item.representedObject = "target:" + ConnectionTarget.profile(profile.id).key
+            item.toolTip = profile.url
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let actions: [(String, String)] = [
+            ("add", japanese ? "接続先を追加…" : "Add Connection…"),
+            ("edit", japanese ? "選択中の接続先を編集…" : "Edit Selected Connection…"),
+            ("delete", japanese ? "選択中の接続先を削除…" : "Delete Selected Connection…"),
+        ]
+        for (action, title) in actions {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.representedObject = "action:" + action
+            // DATABASE_URL は編集・削除できない
+            if action != "add", selectedTarget == .environment {
+                item.isEnabled = false
+            }
+            menu.addItem(item)
+        }
+        menu.autoenablesItems = false
+        selectConnectionMenuItem()
+    }
+
+    /// メニューの表示を、選択中の接続先に合わせる
+    private func selectConnectionMenuItem() {
+        let key = "target:" + selectedTarget.key
+        if let item = connectionPopUp.itemArray.first(where: { ($0.representedObject as? String) == key }) {
+            connectionPopUp.select(item)
+        } else {
+            selectedTarget = .environment
+            ConnectionStore.selectedTarget = .environment
+            connectionPopUp.selectItem(at: 0)
+        }
+    }
+
+    @objc private func connectionPopUpDidChange(_ sender: NSPopUpButton) {
+        guard let value = sender.selectedItem?.representedObject as? String else { return }
+        if value.hasPrefix("action:") {
+            // 操作の項目は選んだままにしない
+            selectConnectionMenuItem()
+            switch value.dropFirst("action:".count) {
+            case "add": editConnectionProfile(nil)
+            case "edit":
+                if case .profile(let id) = selectedTarget, let profile = connectionProfiles.first(where: { $0.id == id }) {
+                    editConnectionProfile(profile)
+                }
+            case "delete": deleteSelectedConnectionProfile()
+            default: break
+            }
+            return
+        }
+        let target = ConnectionTarget(key: String(value.dropFirst("target:".count)))
+        guard target != selectedTarget else { return }
+        switchConnection(to: target)
+    }
+
+    /// 接続先を切り替える。接続中なら切断して、新しい接続先につなぎ直す
+    private func switchConnection(to target: ConnectionTarget) {
+        selectedTarget = target
+        ConnectionStore.selectedTarget = target
+        rebuildConnectionMenu()
+        disconnect()
+        connect()
+    }
+
+    /// 接続先を追加（profile が nil）または編集するシート。パスワードは Keychain に保存する
+    private func editConnectionProfile(_ profile: ConnectionProfile?) {
+        let japanese = language == .japanese
+        let nameField = NSTextField(string: profile?.name ?? "")
+        nameField.placeholderString = japanese ? "本番 DB など" : "e.g. Production"
+        let urlField = NSTextField(string: profile?.url ?? "")
+        urlField.placeholderString = "postgresql://user@host/db?sslmode=require"
+        let passwordField = NSSecureTextField(string: profile.flatMap { Keychain.password(for: $0.id.uuidString) } ?? "")
+        passwordField.placeholderString = japanese ? "URL に含めてもかまいません" : "Can also be included in the URL"
+        for field in [nameField, urlField, passwordField] {
+            field.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        }
+        let grid = NSGridView(views: [
+            [NSTextField(labelWithString: japanese ? "名前:" : "Name:"), nameField],
+            [NSTextField(labelWithString: japanese ? "接続 URL:" : "URL:"), urlField],
+            [NSTextField(labelWithString: japanese ? "パスワード:" : "Password:"), passwordField],
+        ])
+        grid.rowSpacing = 8
+        grid.column(at: 0).xPlacement = .trailing
+        grid.frame = NSRect(origin: .zero, size: grid.fittingSize)
+
+        let alert = NSAlert()
+        alert.messageText = profile == nil
+            ? (japanese ? "接続先を追加" : "Add Connection")
+            : (japanese ? "接続先を編集" : "Edit Connection")
+        alert.informativeText = japanese
+            ? "パスワードはキーチェーンに保存され、設定ファイルには書かれません。"
+            : "The password is stored in the Keychain, not in the settings file."
+        alert.accessoryView = grid
+        alert.addButton(withTitle: japanese ? "保存" : "Save")
+        alert.addButton(withTitle: japanese ? "キャンセル" : "Cancel")
+        alert.window.initialFirstResponder = profile == nil ? nameField : urlField
+
+        Task {
+            guard await alert.beginSheetModal(for: window) == .alertFirstButtonReturn else { return }
+            guard let split = ConnectionStore.splitPassword(from: urlField.stringValue) else {
+                let error = NSAlert()
+                error.messageText = japanese ? "接続 URL の形式が正しくありません" : "The URL is malformed"
+                error.informativeText = "postgresql://user:password@host:5432/db?sslmode=require"
+                _ = await error.beginSheetModal(for: window)
+                return
+            }
+            let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
+            let saved = ConnectionProfile(
+                id: profile?.id ?? UUID(),
+                name: name.isEmpty ? (URLComponents(string: split.url)?.host ?? split.url) : name,
+                url: split.url
+            )
+            // URL にパスワードが書かれていればそちらを優先する
+            Keychain.setPassword(split.password ?? passwordField.stringValue, for: saved.id.uuidString)
+            if let index = connectionProfiles.firstIndex(where: { $0.id == saved.id }) {
+                connectionProfiles[index] = saved
+            } else {
+                connectionProfiles.append(saved)
+            }
+            ConnectionStore.saveProfiles(connectionProfiles)
+            // 追加・編集した接続先につなぎ直す
+            switchConnection(to: .profile(saved.id))
+        }
+    }
+
+    private func deleteSelectedConnectionProfile() {
+        guard case .profile(let id) = selectedTarget,
+              let profile = connectionProfiles.first(where: { $0.id == id }) else { return }
+        let japanese = language == .japanese
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = japanese ? "接続先「\(profile.name)」を削除しますか？" : "Delete the connection \"\(profile.name)\"?"
+        alert.informativeText = japanese
+            ? "キーチェーンに保存したパスワードも削除されます。DB のデータは変わりません。"
+            : "Its password is also removed from the Keychain. No data in the database is changed."
+        alert.addButton(withTitle: japanese ? "削除" : "Delete")
+        alert.addButton(withTitle: japanese ? "キャンセル" : "Cancel")
+        Task {
+            guard await alert.beginSheetModal(for: window) == .alertFirstButtonReturn else { return }
+            connectionProfiles.removeAll { $0.id == id }
+            ConnectionStore.saveProfiles(connectionProfiles)
+            Keychain.deletePassword(for: id.uuidString)
+            switchConnection(to: .environment)
+        }
+    }
+
     // MARK: - Connection
 
     @objc private func connectButtonClicked(_ sender: NSButton) {
@@ -689,10 +872,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func connect() {
+        let target = selectedTarget
+        // 保存した接続先は URL とパスワード（Keychain）、DATABASE_URL は環境変数か .env から読む
+        var urlString: String?
+        var password: String?
+        if case .profile(let id) = target {
+            guard let profile = connectionProfiles.first(where: { $0.id == id }) else {
+                connectionState = .failed(DatabaseError.missingURL)
+                return
+            }
+            urlString = profile.url
+            password = Keychain.password(for: id.uuidString)
+        }
         connectionState = .connecting
+        connectionPopUp.isEnabled = false
         Task {
+            defer { connectionPopUp.isEnabled = true }
             do {
-                let connection = try await Database.connect()
+                let connection = try await Database.connect(urlString: urlString, password: password)
                 let version: String
                 let tables: [TableName]
                 do {
@@ -702,8 +899,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                     try? await connection.close()
                     throw error
                 }
+                // 接続中に別の接続先が選ばれていたら、この接続は使わない
+                guard selectedTarget == target else {
+                    try? await connection.close()
+                    connectionState = .disconnected
+                    return
+                }
                 self.connection = connection
                 self.tables = tables
+                connectedTarget = target
                 connectionState = .connected(serverVersion: version)
                 updateTableList()
                 updateDataControls()
@@ -728,6 +932,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         pendingNavigation = nil
         navigationHistory = []
         displayedForeignKeys = []
+        connectedTarget = nil
         connectionState = .disconnected
         updateTableList()
         showSampleData()
@@ -1284,12 +1489,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         return databaseColumns[index]
     }
 
-    private static func columnLayoutKey(for table: TableName) -> String {
-        "columnLayout.\(table.schema).\(table.name)"
+    /// 同じ名前のテーブルでも接続先が違えば別のものなので、接続先ごとに分けて覚える
+    private func columnLayoutKey(for table: TableName) -> String {
+        "columnLayout.\((connectedTarget ?? selectedTarget).key).\(table.schema).\(table.name)"
     }
 
     private func loadColumnLayout(for table: TableName) -> ColumnLayout? {
-        guard let data = UserDefaults.standard.data(forKey: Self.columnLayoutKey(for: table)) else { return nil }
+        guard let data = UserDefaults.standard.data(forKey: columnLayoutKey(for: table)) else { return nil }
         return try? JSONDecoder().decode(ColumnLayout.self, from: data)
     }
 
@@ -1306,7 +1512,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             }
         }
         guard let data = try? JSONEncoder().encode(layout) else { return }
-        UserDefaults.standard.set(data, forKey: Self.columnLayoutKey(for: displayedTable))
+        UserDefaults.standard.set(data, forKey: columnLayoutKey(for: displayedTable))
     }
 
     /// 保存してあった並び・幅・表示を、作ったばかりの列に当てる。rebuildColumns の中から呼ぶ
@@ -1385,7 +1591,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     /// 保存した見た目を消して、列を作り直す
     @objc private func resetColumnLayoutMenuItemSelected(_ sender: Any?) {
         guard isShowingDatabaseData, let displayedTable else { return }
-        UserDefaults.standard.removeObject(forKey: Self.columnLayoutKey(for: displayedTable))
+        UserDefaults.standard.removeObject(forKey: columnLayoutKey(for: displayedTable))
         rebuildColumns()
         tableView.reloadData()
     }
@@ -1405,6 +1611,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         updateConnectionUI()
         updateTableListPlaceholder()
         updateMainMenu()
+        rebuildConnectionMenu()
         for (index, tab) in SidebarTab.allCases.enumerated() {
             tabControl.setLabel(tab.title(in: language), forSegment: index)
         }
