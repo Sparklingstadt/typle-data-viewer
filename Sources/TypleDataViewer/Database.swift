@@ -32,6 +32,21 @@ struct TableQuery: Equatable, Sendable {
     var ascending = true
     /// 何行目から表示するか（0 始まり）
     var offset = 0
+    /// 列の値がちょうど一致する行だけを出す。外部キーの参照先を開くときに使う
+    var equalityFilters: [ColumnFilter] = []
+}
+
+/// 列 = 値 の条件。値は text で持ち、比べるときに列の型へ変換する
+struct ColumnFilter: Equatable, Sendable {
+    let column: String
+    let value: String
+}
+
+/// 外部キー。columns の値が、参照先テーブルの referencedColumns の値と対応する
+struct ForeignKey: Sendable {
+    let columns: [String]
+    let referencedTable: TableName
+    let referencedColumns: [String]
 }
 
 /// スキーマタブの内容。columns は列ごとに 名前・型・NOT NULL・既定値・キー
@@ -55,6 +70,8 @@ struct TablePage: Sendable {
     let columns: [String]
     let rows: [[String?]]
     let totalCount: Int
+    /// このテーブルから出ている外部キー
+    let foreignKeys: [ForeignKey]
 }
 
 enum Database {
@@ -134,34 +151,51 @@ enum Database {
 
     /// データタブに出す1ページ分を読む。絞り込み・並べ替え・ページ送りはすべてサーバー側で行う
     static func fetchTable(_ table: TableName, query: TableQuery, on connection: PostgresConnection) async throws -> TablePage {
+        // 列名と、SQL での型の表記（varchar(255) など）、型の名前（json など）
         let columnRows = try await connection.query(
             """
-            SELECT column_name, data_type FROM information_schema.columns
-            WHERE table_schema = \(table.schema) AND table_name = \(table.name)
-            ORDER BY ordinal_position
+            SELECT a.attname, format_type(a.atttypid, a.atttypmod), t.typname
+            FROM pg_attribute a
+            JOIN pg_type t ON t.oid = a.atttypid
+            WHERE a.attrelid = format('%I.%I', \(table.schema), \(table.name))::regclass
+              AND a.attnum > 0 AND NOT a.attisdropped
+            ORDER BY a.attnum
             """,
             logger: logger
         )
         var columns: [String] = []
-        var dataTypes: [String: String] = [:]
-        for try await (column, dataType) in columnRows.decode((String, String).self) {
+        var sqlTypes: [String: String] = [:]
+        var typeNames: [String: String] = [:]
+        for try await (column, sqlType, typeName) in columnRows.decode((String, String, String).self) {
             columns.append(column)
-            dataTypes[column] = dataType
+            sqlTypes[column] = sqlType
+            typeNames[column] = typeName
         }
-        guard !columns.isEmpty else { return TablePage(columns: [], rows: [], totalCount: 0) }
+        let foreignKeys = try await fetchForeignKeys(table, on: connection)
+        guard !columns.isEmpty else {
+            return TablePage(columns: [], rows: [], totalCount: 0, foreignKeys: foreignKeys)
+        }
 
         let source = "\(quoteIdentifier(table.schema)).\(quoteIdentifier(table.name))"
 
-        // 検索語は $1 に入れ、どの列とも text にして部分一致（大文字小文字を区別しない）で比べる
-        var whereClause = ""
+        var conditions: [String] = []
         var binds = PostgresBindings()
+        // 検索語は1つのパラメーターに入れ、どの列とも text にして部分一致（大文字小文字を区別しない）で比べる
         let filterText = query.filterText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !filterText.isEmpty {
-            let targets = query.filterColumn.map { columns.contains($0) ? [$0] : columns } ?? columns
-            let conditions = targets.map { "\(quoteIdentifier($0))::text ILIKE $1" }
-            whereClause = " WHERE " + conditions.joined(separator: " OR ")
             binds.append("%" + escapeLikePattern(filterText) + "%")
+            let parameter = "$\(binds.count)"
+            let targets = query.filterColumn.map { columns.contains($0) ? [$0] : columns } ?? columns
+            let matches = targets.map { "\(quoteIdentifier($0))::text ILIKE \(parameter)" }
+            conditions.append("(" + matches.joined(separator: " OR ") + ")")
         }
+        // 一致条件は値を列の型に変換して比べるので、列のインデックスが使える
+        for filter in query.equalityFilters {
+            guard let sqlType = sqlTypes[filter.column] else { continue }
+            binds.append(filter.value)
+            conditions.append("\(quoteIdentifier(filter.column)) = $\(binds.count)::\(sqlType)")
+        }
+        let whereClause = conditions.isEmpty ? "" : " WHERE " + conditions.joined(separator: " AND ")
 
         // 絞り込み後の件数。ページ送りと「全 N 件」の表示に使う
         let countQuery = PostgresQuery(unsafeSQL: "SELECT count(*) FROM \(source)\(whereClause)", binds: binds)
@@ -175,7 +209,7 @@ enum Database {
         var orderTerms: [String] = []
         if let sortColumn = query.sortColumn, columns.contains(sortColumn) {
             var expression = quoteIdentifier(sortColumn)
-            if let dataType = dataTypes[sortColumn], unorderableTypes.contains(dataType) {
+            if let typeName = typeNames[sortColumn], unorderableTypes.contains(typeName) {
                 expression += "::text"
             }
             orderTerms.append(expression + (query.ascending ? " ASC NULLS FIRST" : " DESC NULLS LAST"))
@@ -192,7 +226,40 @@ enum Database {
         for try await row in try await connection.query(PostgresQuery(unsafeSQL: sql, binds: binds), logger: logger) {
             rows.append(try row.map { try $0.decode(String?.self) })
         }
-        return TablePage(columns: columns, rows: rows, totalCount: totalCount)
+        return TablePage(columns: columns, rows: rows, totalCount: totalCount, foreignKeys: foreignKeys)
+    }
+
+    /// テーブルから出ている外部キー。複合キーは列の順番を保って対応させる
+    private static func fetchForeignKeys(_ table: TableName, on connection: PostgresConnection) async throws -> [ForeignKey] {
+        let rows = try await connection.query(
+            """
+            SELECT
+              (SELECT array_agg(a.attname::text ORDER BY k.ord)
+               FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+               JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum),
+              rn.nspname::text, rc.relname::text,
+              (SELECT array_agg(a.attname::text ORDER BY k.ord)
+               FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
+               JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum)
+            FROM pg_constraint c
+            JOIN pg_class rc ON rc.oid = c.confrelid
+            JOIN pg_namespace rn ON rn.oid = rc.relnamespace
+            WHERE c.conrelid = format('%I.%I', \(table.schema), \(table.name))::regclass AND c.contype = 'f'
+            ORDER BY c.conname
+            """,
+            logger: logger
+        )
+        var foreignKeys: [ForeignKey] = []
+        for try await (columns, schema, name, referencedColumns) in rows.decode(
+            ([String], String, String, [String]).self
+        ) {
+            foreignKeys.append(ForeignKey(
+                columns: columns,
+                referencedTable: TableName(schema: schema, name: name),
+                referencedColumns: referencedColumns
+            ))
+        }
+        return foreignKeys
     }
 
     /// スキーマタブに出す内容をまとめて読む
