@@ -4,6 +4,8 @@ import PostgresNIO
 enum DatabaseError: Error {
     case missingURL
     case invalidURL
+    /// SQL 欄で、読み取り用（SELECT など）以外の文が入力された
+    case unsupportedStatement
 }
 
 struct TableName: Hashable, Sendable {
@@ -11,6 +13,9 @@ struct TableName: Hashable, Sendable {
     let name: String
 
     var displayName: String { schema == "public" ? name : "\(schema).\(name)" }
+
+    /// SQL にそのまま書ける、引用符付きの "schema"."name"
+    var sqlName: String { "\(Database.quoteIdentifier(schema)).\(Database.quoteIdentifier(name))" }
 }
 
 struct TableData: Sendable {
@@ -27,6 +32,13 @@ struct TableQuery: Equatable, Sendable {
     var ascending = true
     /// 何行目から表示するか（0 始まり）
     var offset = 0
+}
+
+/// SQL 欄で実行した結果。行数の上限を超えた分は読まず、isTruncated を立てる
+struct QueryResult: Sendable {
+    let columns: [String]
+    let rows: [[String?]]
+    let isTruncated: Bool
 }
 
 /// 1ページ分の行と、絞り込み後の総件数
@@ -194,6 +206,112 @@ enum Database {
         return columns
     }
 
+    // MARK: - SQL query
+
+    /// SQL 欄の結果として読む行数の上限
+    static let queryRowLimit = 1000
+
+    /// SQL 欄に書かれた文を読み取り専用で実行する。
+    /// - 拡張問い合わせプロトコルで送るので、サーバーは1つの文しか受け付けない（; で続けた2つ目の文は実行されない）
+    /// - BEGIN READ ONLY のトランザクション内で実行し、最後は必ず ROLLBACK する。書き込みはサーバーが拒否する
+    /// - 長いクエリで固まらないよう、30 秒で打ち切る
+    static func runReadOnlyQuery(_ sql: String, on connection: PostgresConnection) async throws -> QueryResult {
+        let statement = trimmedStatement(sql)
+        guard !statement.isEmpty else { return QueryResult(columns: [], rows: [], isTruncated: false) }
+
+        let keyword = leadingKeyword(of: statement)
+        let wrapsInSubquery: Bool
+        switch keyword {
+        case "SELECT", "WITH", "VALUES", "TABLE": wrapsInSubquery = true
+        case "EXPLAIN", "SHOW": wrapsInSubquery = false
+        default: throw DatabaseError.unsupportedStatement
+        }
+
+        _ = try await connection.query("BEGIN READ ONLY", logger: logger)
+        do {
+            _ = try await connection.query("SET LOCAL statement_timeout = '30s'", logger: logger)
+            let result: QueryResult
+            if wrapsInSubquery {
+                result = try await runWrapped(statement, on: connection)
+            } else {
+                result = try await runDirect(statement, on: connection)
+            }
+            _ = try await connection.query("ROLLBACK", logger: logger)
+            return result
+        } catch {
+            _ = try? await connection.query("ROLLBACK", logger: logger)
+            throw error
+        }
+    }
+
+    /// SELECT 系の文は副問い合わせに包み、全列をサーバー側で text にして受け取る。
+    /// 列名が重複していても扱えるよう、AS q(c0, c1, …) で位置ごとに別名を付けてから参照する
+    private static func runWrapped(_ statement: String, on connection: PostgresConnection) async throws -> QueryResult {
+        // 1回目は行を読まずに列名だけ得る。末尾が -- のコメントでも閉じ括弧が隠れないよう、改行を挟む
+        let probe = PostgresQuery(unsafeSQL: "SELECT * FROM (\n\(statement)\n) AS q LIMIT 0")
+        let probeRows = try await connection.query(probe, logger: logger)
+        let columns = probeRows.columns.map(\.name)
+        for try await _ in probeRows {}
+        guard !columns.isEmpty else { return QueryResult(columns: [], rows: [], isTruncated: false) }
+
+        let aliases = columns.indices.map { "c\($0)" }
+        let selectList = aliases.map { "\($0)::text" }.joined(separator: ", ")
+        let sql = "SELECT \(selectList) FROM (\n\(statement)\n) AS q(\(aliases.joined(separator: ", ")))"
+            + " LIMIT \(queryRowLimit + 1)"
+
+        var rows: [[String?]] = []
+        for try await row in try await connection.query(PostgresQuery(unsafeSQL: sql), logger: logger) {
+            rows.append(try row.map { try $0.decode(String?.self) })
+        }
+        let isTruncated = rows.count > queryRowLimit
+        return QueryResult(columns: columns, rows: Array(rows.prefix(queryRowLimit)), isTruncated: isTruncated)
+    }
+
+    /// EXPLAIN と SHOW は副問い合わせにできないので、そのまま実行する。どちらも結果は文字列（text か json）
+    private static func runDirect(_ statement: String, on connection: PostgresConnection) async throws -> QueryResult {
+        let result = try await connection.query(PostgresQuery(unsafeSQL: statement), logger: logger)
+        let columns = result.columns.map(\.name)
+        var rows: [[String?]] = []
+        var isTruncated = false
+        for try await row in result {
+            guard rows.count < queryRowLimit else {
+                isTruncated = true
+                continue
+            }
+            rows.append(row.map { cell in
+                // json はバイナリ形式でも中身は JSON の文字列なので、String にできない型はバイト列をそのまま読む
+                (try? cell.decode(String?.self)) ?? cell.bytes.map { String(buffer: $0) }
+            })
+        }
+        return QueryResult(columns: columns, rows: rows, isTruncated: isTruncated)
+    }
+
+    /// 前後の空白と、末尾のセミコロンを取り除く
+    private static func trimmedStatement(_ sql: String) -> String {
+        var statement = sql.trimmingCharacters(in: .whitespacesAndNewlines)
+        while statement.hasSuffix(";") {
+            statement = String(statement.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return statement
+    }
+
+    /// 先頭のコメント（-- と /* */）と開き括弧を飛ばした、最初の単語を大文字で返す
+    private static func leadingKeyword(of statement: String) -> String {
+        var rest = Substring(statement)
+        while true {
+            rest = rest.drop { $0.isWhitespace || $0 == "(" }
+            if rest.hasPrefix("--") {
+                rest = rest.drop { !$0.isNewline }
+            } else if rest.hasPrefix("/*") {
+                guard let end = rest.range(of: "*/") else { return "" }
+                rest = rest[end.upperBound...]
+            } else {
+                break
+            }
+        }
+        return rest.prefix { $0.isLetter }.uppercased()
+    }
+
     /// LIKE の特殊文字（% と _）を文字どおりに扱うよう、既定のエスケープ文字 \ を前に付ける
     private static func escapeLikePattern(_ text: String) -> String {
         var escaped = ""
@@ -206,7 +324,7 @@ enum Database {
         return escaped
     }
 
-    private static func quoteIdentifier(_ identifier: String) -> String {
+    static func quoteIdentifier(_ identifier: String) -> String {
         "\"" + identifier.replacingOccurrences(of: "\"", with: "\"\"") + "\""
     }
 }
