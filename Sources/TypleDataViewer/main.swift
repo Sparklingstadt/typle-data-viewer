@@ -70,8 +70,10 @@ struct DatabaseRow {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
     private var window: NSWindow!
-    private var tableView: NSTableView!
-    private var tablePopUp: NSPopUpButton!
+    private var tableView: CopyableTableView!
+    /// 左側に縦に並べる DB テーブルの一覧
+    private var tableListView: NSTableView!
+    private var tableListPlaceholder: NSTextField!
     private var connectButton: NSButton!
     private var statusLabel: NSTextField!
     private var language: Language = .japanese
@@ -114,15 +116,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private static let databaseColumnPrefix = "db."
+    private static let tableListColumn = NSUserInterfaceItemIdentifier("tableName")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 420),
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 480),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Typle Data Viewer"
+        updateMainMenu()
 
         let languagePopUp = NSPopUpButton()
         languagePopUp.addItems(withTitles: Language.allCases.map(\.displayName))
@@ -133,12 +137,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         let titleLabel = NSTextField(labelWithString: "データ")
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        tablePopUp = NSPopUpButton()
-        tablePopUp.target = self
-        tablePopUp.action = #selector(tableSelectionDidChange(_:))
-        tablePopUp.isHidden = true
-        tablePopUp.translatesAutoresizingMaskIntoConstraints = false
 
         connectButton = NSButton(title: "", target: self, action: #selector(connectButtonClicked(_:)))
         connectButton.bezelStyle = .push
@@ -151,8 +149,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         updateConnectionUI()
 
-        tableView = NSTableView()
+        tableView = CopyableTableView()
         tableView.usesAlternatingRowBackgroundColors = true
+        tableView.allowsMultipleSelection = true
+        tableView.copyValue = { [weak self] row, identifier in
+            self?.cellValue(row: row, identifier: identifier) ?? nil
+        }
         tableView.dataSource = self
         tableView.delegate = self
         tableView.target = self
@@ -165,13 +167,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         scrollView.hasHorizontalScroller = true
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
+        tableListView = NSTableView()
+        tableListView.style = .sourceList
+        tableListView.headerView = nil
+        tableListView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        tableListView.addTableColumn(NSTableColumn(identifier: Self.tableListColumn))
+        tableListView.dataSource = self
+        tableListView.delegate = self
+
+        let listScrollView = NSScrollView()
+        listScrollView.documentView = tableListView
+        listScrollView.hasVerticalScroller = true
+        listScrollView.translatesAutoresizingMaskIntoConstraints = false
+
+        tableListPlaceholder = NSTextField(wrappingLabelWithString: "")
+        tableListPlaceholder.textColor = .secondaryLabelColor
+        tableListPlaceholder.alignment = .center
+        tableListPlaceholder.translatesAutoresizingMaskIntoConstraints = false
+        listScrollView.addSubview(tableListPlaceholder)
+        NSLayoutConstraint.activate([
+            tableListPlaceholder.centerYAnchor.constraint(equalTo: listScrollView.centerYAnchor),
+            tableListPlaceholder.leadingAnchor.constraint(equalTo: listScrollView.leadingAnchor, constant: 12),
+            tableListPlaceholder.trailingAnchor.constraint(equalTo: listScrollView.trailingAnchor, constant: -12),
+        ])
+        updateTableListPlaceholder()
+
+        // 左に一覧、右に表。ウインドウを広げたときは表の側が伸びる
+        let splitView = NSSplitView()
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
+        splitView.addArrangedSubview(listScrollView)
+        splitView.addArrangedSubview(scrollView)
+        splitView.setHoldingPriority(.defaultLow + 1, forSubviewAt: 0)
+        splitView.translatesAutoresizingMaskIntoConstraints = false
+
         let contentView = NSView()
         contentView.addSubview(titleLabel)
-        contentView.addSubview(tablePopUp)
         contentView.addSubview(statusLabel)
         contentView.addSubview(connectButton)
         contentView.addSubview(languagePopUp)
-        contentView.addSubview(scrollView)
+        contentView.addSubview(splitView)
         NSLayoutConstraint.activate([
             languagePopUp.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 12),
             languagePopUp.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -12),
@@ -181,24 +216,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
             statusLabel.centerYAnchor.constraint(equalTo: languagePopUp.centerYAnchor),
             statusLabel.trailingAnchor.constraint(equalTo: connectButton.leadingAnchor, constant: -8),
-            statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: tablePopUp.trailingAnchor, constant: 12),
+            statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 12),
 
             titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
             titleLabel.centerYAnchor.constraint(equalTo: languagePopUp.centerYAnchor),
 
-            tablePopUp.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 8),
-            tablePopUp.centerYAnchor.constraint(equalTo: languagePopUp.centerYAnchor),
+            splitView.topAnchor.constraint(equalTo: languagePopUp.bottomAnchor, constant: 12),
+            splitView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            splitView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            splitView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
 
-            scrollView.topAnchor.constraint(equalTo: languagePopUp.bottomAnchor, constant: 12),
-            scrollView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            listScrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 140),
+            scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 240),
         ])
         window.contentView = contentView
+        // 区切りの初期位置は、分割ビューの大きさが決まってから設定する
+        contentView.layoutSubtreeIfNeeded()
+        splitView.setPosition(200, ofDividerAt: 0)
 
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+
+        // 起動したらすぐ DB に接続する。DATABASE_URL がなければ状態欄にその旨が出る
+        connect()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -208,6 +249,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     func applicationWillTerminate(_ notification: Notification) {
         // 終了処理は待てないので、EventLoopFuture 版で閉じるだけ依頼する
         let _: EventLoopFuture<Void>? = connection?.close()
+    }
+
+    // MARK: - Menu
+
+    /// メニューバー。Cmd+W などは最前面のウインドウに送られるので、値のウインドウでもメインでも効く
+    private func updateMainMenu() {
+        let appName = "Typle Data Viewer"
+        let japanese = language == .japanese
+
+        let appMenu = NSMenu()
+        appMenu.addItem(
+            withTitle: japanese ? "\(appName) を終了" : "Quit \(appName)",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        let appMenuItem = NSMenuItem()
+        appMenuItem.submenu = appMenu
+
+        let fileMenu = NSMenu(title: japanese ? "ファイル" : "File")
+        fileMenu.addItem(
+            withTitle: japanese ? "閉じる" : "Close",
+            action: #selector(NSWindow.performClose(_:)),
+            keyEquivalent: "w"
+        )
+        let fileMenuItem = NSMenuItem()
+        fileMenuItem.submenu = fileMenu
+
+        // 値のテキストはテキストビューが、表の行は CopyableTableView がそれぞれ受け取る
+        let editMenu = NSMenu(title: japanese ? "編集" : "Edit")
+        editMenu.addItem(
+            withTitle: japanese ? "コピー" : "Copy",
+            action: #selector(NSText.copy(_:)),
+            keyEquivalent: "c"
+        )
+        editMenu.addItem(
+            withTitle: japanese ? "すべてを選択" : "Select All",
+            action: #selector(NSResponder.selectAll(_:)),
+            keyEquivalent: "a"
+        )
+        let editMenuItem = NSMenuItem()
+        editMenuItem.submenu = editMenu
+
+        let mainMenu = NSMenu()
+        mainMenu.addItem(appMenuItem)
+        mainMenu.addItem(fileMenuItem)
+        mainMenu.addItem(editMenuItem)
+        NSApp.mainMenu = mainMenu
     }
 
     // MARK: - Connection
@@ -237,9 +325,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 self.connection = connection
                 self.tables = tables
                 connectionState = .connected(serverVersion: version)
-                updateTablePopUp()
-                if let first = tables.first {
-                    loadTable(first)
+                updateTableList()
+                // 選択が変わると tableViewSelectionDidChange から読み込まれる
+                if !tables.isEmpty {
+                    tableListView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
                 }
             } catch {
                 connectionState = .failed(error)
@@ -252,7 +341,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         self.connection = nil
         tables = []
         connectionState = .disconnected
-        updateTablePopUp()
+        updateTableList()
         showSampleData()
         Task { try? await connection.close() }
     }
@@ -276,25 +365,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     // MARK: - Database tables
 
-    private func updateTablePopUp() {
-        let selected = tablePopUp.indexOfSelectedItem
-        tablePopUp.removeAllItems()
-        tablePopUp.isHidden = connection == nil
-        if tables.isEmpty {
-            tablePopUp.addItem(withTitle: language == .japanese ? "テーブルがありません" : "No tables")
-            tablePopUp.isEnabled = false
-        } else {
-            tablePopUp.addItems(withTitles: tables.map(\.displayName))
-            tablePopUp.isEnabled = true
-            if tables.indices.contains(selected) {
-                tablePopUp.selectItem(at: selected)
-            }
+    private func updateTableList() {
+        tableListView.reloadData()
+        updateTableListPlaceholder()
+    }
+
+    private func updateTableListPlaceholder() {
+        tableListPlaceholder.isHidden = !tables.isEmpty
+        switch (connection == nil, language) {
+        case (true, .japanese): tableListPlaceholder.stringValue = "DBに接続するとテーブルが表示されます"
+        case (true, .english): tableListPlaceholder.stringValue = "Connect to DB to list tables"
+        case (false, .japanese): tableListPlaceholder.stringValue = "テーブルがありません"
+        case (false, .english): tableListPlaceholder.stringValue = "No tables"
         }
     }
 
-    @objc private func tableSelectionDidChange(_ sender: NSPopUpButton) {
-        guard tables.indices.contains(sender.indexOfSelectedItem) else { return }
-        loadTable(tables[sender.indexOfSelectedItem])
+    /// 一覧で選ばれている DB テーブル
+    private var selectedTable: TableName? {
+        tables.indices.contains(tableListView.selectedRow) ? tables[tableListView.selectedRow] : nil
     }
 
     private func loadTable(_ table: TableName) {
@@ -303,9 +391,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             do {
                 let data = try await Database.fetchTable(table, on: connection)
                 // 読み込み中に別のテーブルが選ばれていたら、古い結果は捨てる
-                guard self.connection === connection,
-                      tables.indices.contains(tablePopUp.indexOfSelectedItem),
-                      tables[tablePopUp.indexOfSelectedItem] == table else { return }
+                guard self.connection === connection, selectedTable == table else { return }
                 databaseColumns = data.columns
                 databaseRows = data.rows.enumerated().map { DatabaseRow(order: $0.offset, values: $0.element) }
                 rebuildColumns()
@@ -362,9 +448,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     @objc private func languageDidChange(_ sender: NSPopUpButton) {
         language = Language.allCases[sender.indexOfSelectedItem]
         updateConnectionUI()
-        if tables.isEmpty {
-            updateTablePopUp()
-        }
+        updateTableListPlaceholder()
+        updateMainMenu()
         if databaseColumns == nil {
             updateColumnTitles()
             // 果物名は言語で並び順が変わるので、現在のソートをかけ直す
@@ -435,11 +520,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard let value = cellValue(row: row, identifier: tableColumn.identifier) else { return }
 
         var title = tableColumn.title
-        if databaseColumns != nil, tables.indices.contains(tablePopUp.indexOfSelectedItem) {
-            title = "\(tables[tablePopUp.indexOfSelectedItem].displayName).\(title)"
+        if databaseColumns != nil, let selectedTable {
+            title = "\(selectedTable.displayName).\(title)"
         }
         title += language == .japanese ? "（\(row + 1)行目）" : " (row \(row + 1))"
-        ValueWindowController.show(title: title, value: value)
+        ValueWindowController.show(title: title, value: value, language: language)
     }
 
     /// 表に出している値。外側が nil なら該当するセルがない、内側が nil なら DB の NULL
@@ -463,19 +548,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     // MARK: - NSTableViewDataSource
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        databaseColumns == nil ? rows.count : databaseRows.count
+        if tableView === tableListView { return tables.count }
+        return databaseColumns == nil ? rows.count : databaseRows.count
     }
 
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
-        guard !isRebuildingColumns else { return }
+        guard tableView === self.tableView, !isRebuildingColumns else { return }
         sortRows()
         tableView.reloadData()
     }
 
     // MARK: - NSTableViewDelegate
 
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        guard notification.object as? NSTableView === tableListView, let selectedTable else { return }
+        loadTable(selectedTable)
+    }
+
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard let tableColumn else { return nil }
+
+        if tableView === tableListView {
+            guard tables.indices.contains(row) else { return nil }
+            let cell = tableView.makeView(withIdentifier: Self.tableListColumn, owner: self) as? NSTableCellView
+                ?? {
+                    let cell = NSTableCellView()
+                    cell.identifier = Self.tableListColumn
+                    let field = NSTextField(labelWithString: "")
+                    field.lineBreakMode = .byTruncatingTail
+                    field.translatesAutoresizingMaskIntoConstraints = false
+                    cell.addSubview(field)
+                    cell.textField = field
+                    NSLayoutConstraint.activate([
+                        field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+                        field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
+                        field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                    ])
+                    return cell
+                }()
+            cell.textField?.stringValue = tables[row].displayName
+            return cell
+        }
 
         let cell = tableView.makeView(withIdentifier: tableColumn.identifier, owner: self) as? NSTextField
             ?? {
