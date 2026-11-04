@@ -430,6 +430,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         appMenuItem.submenu = appMenu
 
         let fileMenu = NSMenu(title: japanese ? "ファイル" : "File")
+        let exportItem = fileMenu.addItem(
+            withTitle: japanese ? "書き出す…" : "Export…",
+            action: #selector(exportMenuItemSelected(_:)),
+            keyEquivalent: "e"
+        )
+        exportItem.keyEquivalentModifierMask = [.command, .shift]
+        exportItem.target = self
+        fileMenu.addItem(.separator())
         fileMenu.addItem(
             withTitle: japanese ? "閉じる" : "Close",
             action: #selector(NSWindow.performClose(_:)),
@@ -450,6 +458,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             action: #selector(NSResponder.selectAll(_:)),
             keyEquivalent: "a"
         )
+        // 選択した行（選択がなければ全行）を、見出しの行を付けた TSV でコピーする
+        let copyWithHeadersItem = editMenu.addItem(
+            withTitle: japanese ? "見出し付きでコピー" : "Copy with Headers",
+            action: #selector(copyWithHeadersMenuItemSelected(_:)),
+            keyEquivalent: "c"
+        )
+        copyWithHeadersItem.keyEquivalentModifierMask = [.command, .option]
+        copyWithHeadersItem.target = self
         let editMenuItem = NSMenuItem()
         editMenuItem.submenu = editMenu
 
@@ -484,10 +500,109 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(exportMenuItemSelected(_:))
+            || menuItem.action == #selector(copyWithHeadersMenuItemSelected(_:)) {
+            return !tableView.tableColumns.isEmpty
+        }
         if menuItem.action == #selector(reloadMenuItemSelected(_:)) {
             return connection != nil && (sidebarTab == .sql || selectedTable != nil)
         }
         return true
+    }
+
+    // MARK: - Export
+
+    /// 書き出しの保存パネルで選んでいる形式。パネルの形式メニューから変える
+    private var exportFormat: ExportFormat = .csv
+    private weak var exportPanel: NSSavePanel?
+
+    /// 表に出している内容を、見えている列の順・並べ替えた順のまま取り出す。
+    /// - Parameter rowIndexes: 取り出す行。nil なら全行
+    private func displayedContent(rowIndexes: IndexSet? = nil) -> (columns: [String], rows: [[String?]]) {
+        let tableColumns = tableView.tableColumns
+        let indexes = rowIndexes ?? IndexSet(integersIn: 0..<tableView.numberOfRows)
+        let rows = indexes.map { row in
+            tableColumns.map { column -> String? in
+                // 外側の nil（該当するセルがない）は空、内側の nil は DB の NULL
+                guard let value = cellValue(row: row, identifier: column.identifier) else { return "" }
+                return value
+            }
+        }
+        return (tableColumns.map(\.title), rows)
+    }
+
+    /// ファイル名の初期値。表示中のテーブル名、SQL の結果なら query
+    private var exportFileName: String {
+        let base: String
+        if isShowingQueryResult {
+            base = "query"
+        } else if databaseColumns != nil, let selectedTable {
+            base = isShowingSchema ? "\(selectedTable.displayName)_schema" : selectedTable.displayName
+        } else {
+            base = "data"
+        }
+        return base.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: ":", with: "_")
+    }
+
+    /// 表に出している行（データタブではいま表示中のページ）を CSV・TSV・JSON で保存する
+    @objc private func exportMenuItemSelected(_ sender: Any?) {
+        let content = displayedContent()
+        let japanese = language == .japanese
+
+        let panel = NSSavePanel()
+        panel.title = japanese ? "書き出す" : "Export"
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+
+        // 保存パネルの下に形式のメニューを付ける
+        let formatPopUp = NSPopUpButton()
+        formatPopUp.addItems(withTitles: ExportFormat.allCases.map(\.title))
+        formatPopUp.selectItem(at: ExportFormat.allCases.firstIndex(of: exportFormat) ?? 0)
+        formatPopUp.target = self
+        formatPopUp.action = #selector(exportFormatDidChange(_:))
+        let formatLabel = NSTextField(labelWithString: japanese ? "形式:" : "Format:")
+        let accessory = NSStackView(views: [formatLabel, formatPopUp])
+        accessory.orientation = .horizontal
+        accessory.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
+        panel.accessoryView = accessory
+
+        panel.allowedContentTypes = [exportFormat.contentType]
+        panel.nameFieldStringValue = "\(exportFileName).\(exportFormat.fileExtension)"
+        exportPanel = panel
+
+        Task {
+            let response = await panel.beginSheetModal(for: window)
+            guard response == .OK, let url = panel.url else { return }
+            let data = TableExporter.data(columns: content.columns, rows: content.rows, format: exportFormat)
+            do {
+                try data.write(to: url, options: .atomic)
+            } catch {
+                let alert = NSAlert()
+                alert.messageText = japanese ? "書き出せませんでした" : "Could not export"
+                alert.informativeText = error.localizedDescription
+                alert.beginSheetModal(for: window, completionHandler: nil)
+            }
+        }
+    }
+
+    /// 形式を変えたら、保存できる種類とファイル名の拡張子も合わせる
+    @objc private func exportFormatDidChange(_ sender: NSPopUpButton) {
+        guard ExportFormat.allCases.indices.contains(sender.indexOfSelectedItem) else { return }
+        exportFormat = ExportFormat.allCases[sender.indexOfSelectedItem]
+        guard let exportPanel else { return }
+        exportPanel.allowedContentTypes = [exportFormat.contentType]
+        let name = (exportPanel.nameFieldStringValue as NSString).deletingPathExtension
+        exportPanel.nameFieldStringValue = "\(name).\(exportFormat.fileExtension)"
+    }
+
+    @objc private func copyWithHeadersMenuItemSelected(_ sender: Any?) {
+        let selection = tableView.selectedRowIndexes
+        let content = displayedContent(rowIndexes: selection.isEmpty ? nil : selection)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(
+            TableExporter.string(columns: content.columns, rows: content.rows, format: .tsv),
+            forType: .string
+        )
     }
 
     // MARK: - Connection
