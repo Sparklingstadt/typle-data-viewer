@@ -18,6 +18,38 @@ struct TableName: Hashable, Sendable {
     var sqlName: String { "\(Database.quoteIdentifier(schema)).\(Database.quoteIdentifier(name))" }
 }
 
+/// 一覧に出すリレーションの種類（pg_class.relkind）
+enum RelationKind: Sendable {
+    case table
+    case partitionedTable
+    case view
+    case materializedView
+    case foreignTable
+
+    init?(relkind: String) {
+        switch relkind {
+        case "r": self = .table
+        case "p": self = .partitionedTable
+        case "v": self = .view
+        case "m": self = .materializedView
+        case "f": self = .foreignTable
+        default: return nil
+        }
+    }
+
+    /// 行の物理位置 ctid を持つか。ページ送りで順序を固定するのに使う。ビューと外部テーブルは持たない
+    var hasCtid: Bool {
+        switch self {
+        case .table, .partitionedTable, .materializedView: true
+        case .view, .foreignTable: false
+        }
+    }
+}
+
+/// 数値として右寄せで表示する型（pg_type.typname）
+private let numericTypeNames: Set<String> = ["int2", "int4", "int8", "float4", "float8", "numeric", "money", "oid"]
+private let numericDataTypes: Set<PostgresDataType> = [.int2, .int4, .int8, .float4, .float8, .numeric, .money, .oid]
+
 struct TableData: Sendable {
     let columns: [String]
     let rows: [[String?]]
@@ -61,6 +93,8 @@ struct TableSchema: Sendable {
 /// SQL 欄で実行した結果。行数の上限を超えた分は読まず、isTruncated を立てる
 struct QueryResult: Sendable {
     let columns: [String]
+    /// 数値の列の位置。右寄せで表示する
+    var numericColumns: Set<Int> = []
     let rows: [[String?]]
     let isTruncated: Bool
 }
@@ -72,6 +106,8 @@ struct TablePage: Sendable {
     let totalCount: Int
     /// このテーブルから出ている外部キー
     let foreignKeys: [ForeignKey]
+    /// 数値の列の位置。右寄せで表示する
+    var numericColumns: Set<Int> = []
 }
 
 enum Database {
@@ -136,24 +172,32 @@ enum Database {
         return "?"
     }
 
-    static func listTables(on connection: PostgresConnection) async throws -> [TableName] {
+    /// テーブル・ビュー・マテリアライズドビュー・外部テーブルの一覧。SELECT 権限のあるものだけ
+    static func listTables(on connection: PostgresConnection) async throws -> [(table: TableName, kind: RelationKind)] {
         let rows = try await connection.query(
             """
-            SELECT table_schema, table_name FROM information_schema.tables
-            WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema')
-            ORDER BY table_schema, table_name
+            SELECT n.nspname::text, c.relname::text, c.relkind::text
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg_toast%'
+              AND has_table_privilege(c.oid, 'SELECT')
+            ORDER BY n.nspname, c.relname
             """,
             logger: logger
         )
-        var tables: [TableName] = []
-        for try await (schema, name) in rows.decode((String, String).self) {
-            tables.append(TableName(schema: schema, name: name))
+        var tables: [(table: TableName, kind: RelationKind)] = []
+        for try await (schema, name, relkind) in rows.decode((String, String, String).self) {
+            guard let kind = RelationKind(relkind: relkind) else { continue }
+            tables.append((TableName(schema: schema, name: name), kind))
         }
         return tables
     }
 
     /// データタブに出す1ページ分を読む。絞り込み・並べ替え・ページ送りはすべてサーバー側で行う
-    static func fetchTable(_ table: TableName, query: TableQuery, on connection: PostgresConnection) async throws -> TablePage {
+    static func fetchTable(
+        _ table: TableName, kind: RelationKind, query: TableQuery, on connection: PostgresConnection
+    ) async throws -> TablePage {
         // 列名と、SQL での型の表記（varchar(255) など）、型の名前（json など）
         let columnRows = try await connection.query(
             """
@@ -217,19 +261,26 @@ enum Database {
             }
             orderTerms.append(expression + (query.ascending ? " ASC NULLS FIRST" : " DESC NULLS LAST"))
         }
-        orderTerms.append("ctid")
+        // ビューには ctid がないので、並べ替えの列だけで並べる（同じ値の行の順番は保証されない）
+        if kind.hasCtid {
+            orderTerms.append("ctid")
+        }
+        let orderClause = orderTerms.isEmpty ? "" : " ORDER BY " + orderTerms.joined(separator: ", ")
 
         // 型ごとのデコードを避けるため、全列をサーバー側で text に変換して受け取る
         let selectList = columns.map { "\(quoteIdentifier($0))::text" }.joined(separator: ", ")
         let offset = max(0, query.offset)
         let sql = "SELECT \(selectList) FROM \(source)\(whereClause)"
-            + " ORDER BY \(orderTerms.joined(separator: ", ")) LIMIT \(pageSize) OFFSET \(offset)"
+            + "\(orderClause) LIMIT \(pageSize) OFFSET \(offset)"
 
         var rows: [[String?]] = []
         for try await row in try await connection.query(PostgresQuery(unsafeSQL: sql, binds: binds), logger: logger) {
             rows.append(try row.map { try $0.decode(String?.self) })
         }
-        return TablePage(columns: columns, rows: rows, totalCount: totalCount, foreignKeys: foreignKeys)
+        let numericColumns = Set(columns.indices.filter { numericTypeNames.contains(typeNames[columns[$0]] ?? "") })
+        return TablePage(
+            columns: columns, rows: rows, totalCount: totalCount, foreignKeys: foreignKeys, numericColumns: numericColumns
+        )
     }
 
     /// テーブルから出ている外部キー。複合キーは列の順番を保って対応させる
@@ -398,6 +449,10 @@ enum Database {
         let probe = PostgresQuery(unsafeSQL: "SELECT * FROM (\n\(statement)\n) AS q LIMIT 0")
         let probeRows = try await connection.query(probe, logger: logger)
         let columns = probeRows.columns.map(\.name)
+        // 外側で text に変換する前の、元の型で数値かどうかを見る
+        let numericColumns = Set(probeRows.columns.indices.filter {
+            numericDataTypes.contains(probeRows.columns[$0].dataType)
+        })
         for try await _ in probeRows {}
         guard !columns.isEmpty else { return QueryResult(columns: [], rows: [], isTruncated: false) }
 
@@ -411,7 +466,12 @@ enum Database {
             rows.append(try row.map { try $0.decode(String?.self) })
         }
         let isTruncated = rows.count > queryRowLimit
-        return QueryResult(columns: columns, rows: Array(rows.prefix(queryRowLimit)), isTruncated: isTruncated)
+        return QueryResult(
+            columns: columns,
+            numericColumns: numericColumns,
+            rows: Array(rows.prefix(queryRowLimit)),
+            isTruncated: isTruncated
+        )
     }
 
     /// EXPLAIN と SHOW は副問い合わせにできないので、そのまま実行する。どちらも結果は文字列（text か json）

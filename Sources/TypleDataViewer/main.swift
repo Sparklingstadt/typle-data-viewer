@@ -133,6 +133,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     /// 接続中は DB のテーブル一覧、未接続時は空
     private var tables: [TableName] = []
+    /// 一覧の各項目がテーブルかビューかなど。一覧のアイコンと、ページ送りの並べ方に使う
+    private var tableKinds: [TableName: RelationKind] = [:]
+    /// 表示中の表で、数値として右寄せにする列の位置
+    private var numericColumnIndexes: Set<Int> = []
+
+    private static let cellFont = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+    /// NULL は斜体の薄い文字にして、空文字（何も表示しない）と見分けられるようにする
+    private static let nullFont = NSFontManager.shared.convert(cellFont, toHaveTrait: .italicFontMask)
     /// 表示中の DB テーブル。nil のときはサンプルの果物データを表示する
     private var databaseColumns: [String]?
     private var databaseRows: [DatabaseRow] = []
@@ -891,7 +899,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             do {
                 let connection = try await Database.connect(urlString: urlString, password: password)
                 let version: String
-                let tables: [TableName]
+                let tables: [(table: TableName, kind: RelationKind)]
                 do {
                     version = try await Database.serverVersion(of: connection)
                     tables = try await Database.listTables(on: connection)
@@ -906,7 +914,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                     return
                 }
                 self.connection = connection
-                self.tables = tables
+                self.tables = tables.map(\.table)
+                tableKinds = Dictionary(tables.map { ($0.table, $0.kind) }, uniquingKeysWith: { first, _ in first })
                 connectedTarget = target
                 connectionState = .connected(serverVersion: version)
                 updateTableList()
@@ -925,6 +934,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard let connection else { return }
         self.connection = nil
         tables = []
+        tableKinds = [:]
         queryTable = nil
         dataQuery = TableQuery()
         searchField.stringValue = ""
@@ -1020,6 +1030,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             searchField.stringValue = ""
         }
         let query = dataQuery
+        let kind = tableKinds[table] ?? .table
         loadGeneration += 1
         let generation = loadGeneration
         Task {
@@ -1028,12 +1039,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 var totalCount = 0
                 var schema: TableSchema?
                 var foreignKeys: [ForeignKey] = []
+                var numericColumns: Set<Int> = []
                 switch tab {
                 case .data:
-                    let page = try await Database.fetchTable(table, query: query, on: connection)
+                    let page = try await Database.fetchTable(table, kind: kind, query: query, on: connection)
                     data = TableData(columns: page.columns, rows: page.rows)
                     totalCount = page.totalCount
                     foreignKeys = page.foreignKeys
+                    numericColumns = page.numericColumns
                 case .schema:
                     let fetched = try await Database.fetchSchema(table, on: connection)
                     schema = fetched
@@ -1063,6 +1076,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 displayedOffset = query.offset
                 totalRowCount = totalCount
                 displayedForeignKeys = foreignKeys
+                numericColumnIndexes = numericColumns
                 databaseColumns = data.columns
                 databaseRows = data.rows.enumerated().map { DatabaseRow(order: $0.offset, values: $0.element) }
                 if columnsChanged {
@@ -1389,6 +1403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         isShowingQueryResult = true
         displayedTable = nil
         databaseColumns = lastQueryResult?.columns ?? []
+        numericColumnIndexes = lastQueryResult?.numericColumns ?? []
         databaseRows = (lastQueryResult?.rows ?? []).enumerated().map {
             DatabaseRow(order: $0.offset, values: $0.element)
         }
@@ -1612,6 +1627,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         updateTableListPlaceholder()
         updateMainMenu()
         rebuildConnectionMenu()
+        // 一覧のアイコンの説明（ツールチップ）を付け直す
+        tableListView.reloadData()
         for (index, tab) in SidebarTab.allCases.enumerated() {
             tabControl.setLabel(tab.title(in: language), forSegment: index)
         }
@@ -1727,6 +1744,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
 
+    // MARK: - Relation kinds
+
+    private static func symbolName(for kind: RelationKind) -> String {
+        switch kind {
+        case .table, .partitionedTable: "tablecells"
+        case .view: "eye"
+        case .materializedView: "square.stack.3d.up"
+        case .foreignTable: "network"
+        }
+    }
+
+    private static func kindTitle(_ kind: RelationKind, in language: Language) -> String {
+        switch (kind, language) {
+        case (.table, .japanese): "テーブル"
+        case (.table, .english): "Table"
+        case (.partitionedTable, .japanese): "パーティションテーブル"
+        case (.partitionedTable, .english): "Partitioned table"
+        case (.view, .japanese): "ビュー"
+        case (.view, .english): "View"
+        case (.materializedView, .japanese): "マテリアライズドビュー"
+        case (.materializedView, .english): "Materialized view"
+        case (.foreignTable, .japanese): "外部テーブル"
+        case (.foreignTable, .english): "Foreign table"
+        }
+    }
+
     // MARK: - NSTableViewDataSource
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -1766,19 +1809,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 ?? {
                     let cell = NSTableCellView()
                     cell.identifier = Self.tableListColumn
+                    // 先頭に、テーブルかビューかなどを表すアイコンを置く
+                    let icon = NSImageView()
+                    icon.translatesAutoresizingMaskIntoConstraints = false
+                    cell.addSubview(icon)
+                    cell.imageView = icon
                     let field = NSTextField(labelWithString: "")
                     field.lineBreakMode = .byTruncatingTail
                     field.translatesAutoresizingMaskIntoConstraints = false
                     cell.addSubview(field)
                     cell.textField = field
                     NSLayoutConstraint.activate([
-                        field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+                        icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+                        icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                        icon.widthAnchor.constraint(equalToConstant: 16),
+                        icon.heightAnchor.constraint(equalToConstant: 16),
+                        field.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 4),
                         field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
                         field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
                     ])
                     return cell
                 }()
-            cell.textField?.stringValue = tables[row].displayName
+            let table = tables[row]
+            let kind = tableKinds[table] ?? .table
+            cell.textField?.stringValue = table.displayName
+            cell.imageView?.image = NSImage(
+                systemSymbolName: Self.symbolName(for: kind),
+                accessibilityDescription: Self.kindTitle(kind, in: language)
+            )
+            cell.toolTip = Self.kindTitle(kind, in: language)
             return cell
         }
 
@@ -1798,7 +1857,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             let value = databaseRows[row].values[index]
             cell.stringValue = value ?? "NULL"
             cell.textColor = value == nil ? .tertiaryLabelColor : .labelColor
-            cell.alignment = .left
+            cell.font = value == nil ? Self.nullFont : Self.cellFont
+            cell.alignment = numericColumnIndexes.contains(index) ? .right : .left
             return cell
         }
 
@@ -1810,6 +1870,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         case .count: cell.stringValue = String(item.count)
         }
         cell.textColor = .labelColor
+        cell.font = Self.cellFont
         cell.alignment = column == .fruit ? .left : .right
         return cell
     }
