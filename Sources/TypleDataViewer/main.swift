@@ -86,6 +86,12 @@ enum SidebarTab: CaseIterable {
     }
 }
 
+/// 右クリックメニューの「参照先を開く」で開く先。参照先テーブルと、その列の値の一致条件
+struct ForeignKeyJump {
+    let table: TableName
+    let filters: [ColumnFilter]
+}
+
 /// DB から読んだ1行。ソート後も同値の行を元の順に並べるため、取得時の順番を持つ
 struct DatabaseRow {
     let order: Int
@@ -94,7 +100,7 @@ struct DatabaseRow {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate,
-    NSMenuItemValidation {
+    NSMenuItemValidation, NSMenuDelegate {
     private var window: NSWindow!
     private var tableView: CopyableTableView!
     /// 左側に縦に並べる DB テーブルの一覧
@@ -138,6 +144,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var totalRowCount = 0
     /// 読み込みを始めるたびに増やす。追い越された古い結果を捨てるのに使う
     private var loadGeneration = 0
+
+    // 外部キーの参照先へのジャンプ
+    /// 表示中のテーブルから出ている外部キー
+    private var displayedForeignKeys: [ForeignKey] = []
+    /// 次にこのテーブルを読むときに使う条件。ジャンプや「戻る」で、選択の変更より先に入れておく
+    private var pendingNavigation: (table: TableName, query: TableQuery)?
+    /// ジャンプする前に見ていたテーブルと条件。「戻る」で1つずつ戻る
+    private var navigationHistory: [(table: TableName, query: TableQuery)] = []
+    /// 一致条件で絞り込んでいるときに絞り込み欄に出す、条件と解除ボタン
+    private var equalityFilterLabel: NSTextField!
+    private var clearEqualityFilterButton: NSButton!
 
     // スキーマタブで表の上に出す、推定行数・大きさ・インデックス
     private var schemaInfoBar: NSStackView!
@@ -235,6 +252,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         tableView.delegate = self
         tableView.target = self
         tableView.doubleAction = #selector(tableViewDoubleClicked(_:))
+        // 右クリックしたセルに合わせて、開くときに中身を作る
+        let cellMenu = NSMenu()
+        cellMenu.autoenablesItems = false
+        cellMenu.delegate = self
+        tableView.menu = cellMenu
         rebuildColumns()
 
         let scrollView = NSScrollView()
@@ -251,7 +273,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         searchField.target = self
         searchField.action = #selector(filterDidChange(_:))
         searchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        filterBar = NSStackView(views: [filterColumnPopUp, searchField])
+        equalityFilterLabel = NSTextField(labelWithString: "")
+        equalityFilterLabel.lineBreakMode = .byTruncatingMiddle
+        equalityFilterLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        clearEqualityFilterButton = NSButton(title: "", target: self, action: #selector(clearEqualityFilterClicked(_:)))
+        clearEqualityFilterButton.bezelStyle = .inline
+        filterBar = NSStackView(views: [filterColumnPopUp, searchField, equalityFilterLabel, clearEqualityFilterButton])
         filterBar.orientation = .horizontal
         filterBar.spacing = 8
         filterBar.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
@@ -501,6 +528,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             keyEquivalent: "r"
         )
         reloadItem.target = self
+        let backItem = viewMenu.addItem(
+            withTitle: japanese ? "戻る" : "Back",
+            action: #selector(backMenuItemSelected(_:)),
+            keyEquivalent: "["
+        )
+        backItem.target = self
         let viewMenuItem = NSMenuItem()
         viewMenuItem.submenu = viewMenu
 
@@ -530,6 +563,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         if menuItem.action == #selector(reloadMenuItemSelected(_:)) {
             return connection != nil && (sidebarTab == .sql || selectedTable != nil)
+        }
+        if menuItem.action == #selector(backMenuItemSelected(_:)) {
+            return connection != nil && !navigationHistory.isEmpty
         }
         return true
     }
@@ -676,6 +712,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         dataQuery = TableQuery()
         searchField.stringValue = ""
         lastQueryResult = nil
+        pendingNavigation = nil
+        navigationHistory = []
+        displayedForeignKeys = []
         connectionState = .disconnected
         updateTableList()
         showSampleData()
@@ -749,8 +788,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             prefillQueryIfEmpty(for: table)
             return
         }
-        if table != queryTable {
+        if let pendingNavigation, pendingNavigation.table == table {
+            // ジャンプや「戻る」で開いたときは、用意しておいた条件で読む
+            self.pendingNavigation = nil
+            queryTable = table
+            dataQuery = pendingNavigation.query
+            searchField.stringValue = pendingNavigation.query.filterText
+        } else if table != queryTable {
             // 別のテーブルに移ったら、絞り込み・並べ替え・ページを最初に戻す
+            pendingNavigation = nil
             queryTable = table
             dataQuery = TableQuery()
             searchField.stringValue = ""
@@ -763,11 +809,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 let data: TableData
                 var totalCount = 0
                 var schema: TableSchema?
+                var foreignKeys: [ForeignKey] = []
                 switch tab {
                 case .data:
                     let page = try await Database.fetchTable(table, query: query, on: connection)
                     data = TableData(columns: page.columns, rows: page.rows)
                     totalCount = page.totalCount
+                    foreignKeys = page.foreignKeys
                 case .schema:
                     let fetched = try await Database.fetchSchema(table, on: connection)
                     schema = fetched
@@ -796,6 +844,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 displayedTable = table
                 displayedOffset = query.offset
                 totalRowCount = totalCount
+                displayedForeignKeys = foreignKeys
                 databaseColumns = data.columns
                 databaseRows = data.rows.enumerated().map { DatabaseRow(order: $0.offset, values: $0.element) }
                 if columnsChanged {
@@ -864,6 +913,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         filterBar.isHidden = !isShowingDatabaseData
         pagingBar.isHidden = !isShowingDatabaseData
+        let equalityFilters = dataQuery.equalityFilters
+        equalityFilterLabel.isHidden = equalityFilters.isEmpty
+        clearEqualityFilterButton.isHidden = equalityFilters.isEmpty
+        let conditions = equalityFilters.map { "\($0.column) = \($0.value)" }.joined(separator: ", ")
+        equalityFilterLabel.stringValue = (japanese ? "参照で絞り込み: " : "Referenced: ") + conditions
+        equalityFilterLabel.toolTip = conditions
+        clearEqualityFilterButton.title = japanese ? "解除" : "Clear"
         guard isShowingDatabaseData, let databaseColumns else { return }
 
         // 先頭は「すべての列」。列名は項目の representedObject に持たせる
@@ -923,6 +979,113 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             : indexes.joined(separator: "\n")
         schemaIndexesLabel.stringValue = indexesText
         schemaIndexesLabel.toolTip = indexes.isEmpty ? nil : indexesText
+    }
+
+    // MARK: - Foreign keys
+
+    /// 右クリックしたセルに合わせたメニュー。「値を開く」と、その列を含む外部キーごとの「参照先を開く」
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === tableView.menu else { return }
+        menu.removeAllItems()
+        let row = tableView.clickedRow
+        let columnIndex = tableView.clickedColumn
+        guard row >= 0, tableView.tableColumns.indices.contains(columnIndex) else { return }
+        let japanese = language == .japanese
+
+        let openItem = NSMenuItem(
+            title: japanese ? "値を開く" : "Open Value",
+            action: #selector(openClickedValueMenuItemSelected(_:)),
+            keyEquivalent: ""
+        )
+        openItem.target = self
+        menu.addItem(openItem)
+
+        let identifier = tableView.tableColumns[columnIndex].identifier
+        guard isShowingDatabaseData, let databaseColumns,
+              let index = Int(identifier.rawValue.dropFirst(Self.databaseColumnPrefix.count)),
+              databaseColumns.indices.contains(index), databaseRows.indices.contains(row) else { return }
+        let values = databaseRows[row].values
+        let columnName = databaseColumns[index]
+
+        let foreignKeys = displayedForeignKeys.filter { $0.columns.contains(columnName) }
+        if !foreignKeys.isEmpty {
+            menu.addItem(.separator())
+        }
+        for foreignKey in foreignKeys {
+            // 複合キーなら、キーのすべての列の値で絞り込む
+            let keyValues = foreignKey.columns.map { name -> String? in
+                databaseColumns.firstIndex(of: name).flatMap { values.indices.contains($0) ? values[$0] : nil }
+            }
+            let conditions = zip(foreignKey.referencedColumns, keyValues)
+                .map { "\($0) = \($1 ?? "NULL")" }
+                .joined(separator: ", ")
+            let target = foreignKey.referencedTable
+            let item = NSMenuItem(
+                title: japanese
+                    ? "参照先を開く: \(target.displayName)（\(conditions)）"
+                    : "Open Referenced Row: \(target.displayName) (\(conditions))",
+                action: #selector(followForeignKeyMenuItemSelected(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            // NULL の外部キーは何も参照していない。一覧にないテーブルも開けない
+            let nonNullValues = keyValues.compactMap { $0 }
+            item.isEnabled = nonNullValues.count == keyValues.count && tables.contains(target)
+            item.representedObject = ForeignKeyJump(
+                table: target,
+                filters: zip(foreignKey.referencedColumns, nonNullValues).map { ColumnFilter(column: $0, value: $1) }
+            )
+            menu.addItem(item)
+        }
+    }
+
+    @objc private func openClickedValueMenuItemSelected(_ sender: NSMenuItem) {
+        tableViewDoubleClicked(tableView)
+    }
+
+    @objc private func followForeignKeyMenuItemSelected(_ sender: NSMenuItem) {
+        guard let jump = sender.representedObject as? ForeignKeyJump else { return }
+        // いま見ている場所を「戻る」の行き先として覚えておく
+        if isShowingDatabaseData, let displayedTable {
+            var current = dataQuery
+            current.offset = displayedOffset
+            navigationHistory.append((displayedTable, current))
+        }
+        var query = TableQuery()
+        query.equalityFilters = jump.filters
+        navigate(to: jump.table, query: query)
+    }
+
+    @objc private func backMenuItemSelected(_ sender: Any?) {
+        guard let previous = navigationHistory.popLast() else { return }
+        navigate(to: previous.table, query: previous.query)
+    }
+
+    @objc private func clearEqualityFilterClicked(_ sender: Any?) {
+        guard isShowingDatabaseData, !dataQuery.equalityFilters.isEmpty else { return }
+        dataQuery.equalityFilters = []
+        dataQuery.offset = 0
+        reloadSelectedTable()
+    }
+
+    /// テーブルを選び直し、指定した条件でデータタブに出す
+    private func navigate(to table: TableName, query: TableQuery) {
+        guard let index = tables.firstIndex(of: table) else { return }
+        if sidebarTab != .data {
+            sidebarTab = .data
+            tabControl.selectedSegment = SidebarTab.allCases.firstIndex(of: .data) ?? 0
+        }
+        pendingNavigation = (table, query)
+        // 並べ替えの矢印を条件に合わせ直すため、同じテーブルでも列を作り直させる
+        displayedTable = nil
+        if tableListView.selectedRow == index {
+            // 選択が変わらないと読み込みが始まらないので、自分で読む
+            loadTable(table)
+        } else {
+            // 選択が変わると tableViewSelectionDidChange から読み込まれる
+            tableListView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        }
+        tableListView.scrollRowToVisible(index)
     }
 
     /// 検索語か対象の列が変わったら、先頭のページから読み直す
