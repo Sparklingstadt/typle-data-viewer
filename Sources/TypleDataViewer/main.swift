@@ -232,7 +232,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private static let databaseColumnPrefix = "db."
     private static let tableListColumn = NSUserInterfaceItemIdentifier("tableName")
 
+    // MARK: - Saved state
+    // 前回終了したときの言語・タブ・テーブル・SQL・ウインドウの位置と大きさを、次の起動で戻す
+
+    private static let languageKey = "language"
+    private static let sidebarTabKey = "sidebarTab"
+    private static let lastSQLKey = "lastSQL"
+    private static let windowFrameName = "MainWindow"
+    private static let splitViewName = "MainSplitView"
+
+    private func lastTableKey(for target: ConnectionTarget) -> String {
+        "lastTable.\(target.key)"
+    }
+
+    private func restoreSavedSettings() {
+        let defaults = UserDefaults.standard
+        if let index = defaults.object(forKey: Self.languageKey) as? Int, Language.allCases.indices.contains(index) {
+            language = Language.allCases[index]
+        }
+        if let index = defaults.object(forKey: Self.sidebarTabKey) as? Int, SidebarTab.allCases.indices.contains(index) {
+            sidebarTab = SidebarTab.allCases[index]
+        }
+    }
+
+    /// 前回このつなぎ先で見ていたテーブル。一覧になければ nil
+    private func savedTableIndex(for target: ConnectionTarget) -> Int? {
+        guard let saved = UserDefaults.standard.string(forKey: lastTableKey(for: target)) else { return nil }
+        let parts = saved.split(separator: "\t", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { return nil }
+        return tables.firstIndex(of: TableName(schema: parts[0], name: parts[1]))
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        restoreSavedSettings()
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 900, height: 480),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -344,6 +376,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         sqlTextView.isAutomaticTextReplacementEnabled = false
         sqlTextView.isAutomaticSpellingCorrectionEnabled = false
         sqlTextView.isContinuousSpellCheckingEnabled = false
+        sqlTextView.usesFindBar = true
+        // 前回終了したときの SQL を戻す
+        sqlTextView.string = UserDefaults.standard.string(forKey: Self.lastSQLKey) ?? ""
 
         queryStatusLabel = NSTextField(labelWithString: "")
         queryStatusLabel.textColor = .secondaryLabelColor
@@ -446,6 +481,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         splitView.addArrangedSubview(dataPane)
         splitView.setHoldingPriority(.defaultLow + 1, forSubviewAt: 0)
         splitView.translatesAutoresizingMaskIntoConstraints = false
+        // 区切りの位置は自動で保存・復元する
+        let hasSavedSplit = UserDefaults.standard.object(forKey: "NSSplitView Subview Frames \(Self.splitViewName)") != nil
+        splitView.autosaveName = Self.splitViewName
 
         let contentView = NSView()
         contentView.addSubview(titleLabel)
@@ -483,9 +521,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         window.contentView = contentView
         // 区切りの初期位置は、分割ビューの大きさが決まってから設定する
         contentView.layoutSubtreeIfNeeded()
-        splitView.setPosition(200, ofDividerAt: 0)
+        if !hasSavedSplit {
+            splitView.setPosition(200, ofDividerAt: 0)
+        }
 
-        window.center()
+        // ウインドウの位置と大きさも自動で保存し、保存したものがなければ中央に置く
+        if !window.setFrameUsingName(Self.windowFrameName) {
+            window.center()
+        }
+        window.setFrameAutosaveName(Self.windowFrameName)
+        // SQL タブで終了していたら、その画面から始める
+        if sidebarTab == .sql {
+            showQueryResult()
+        }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
@@ -498,6 +546,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        UserDefaults.standard.set(sqlTextView.string, forKey: Self.lastSQLKey)
         // 終了処理は待てないので、EventLoopFuture 版で閉じるだけ依頼する
         let _: EventLoopFuture<Void>? = connection?.close()
     }
@@ -547,6 +596,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             action: #selector(NSResponder.selectAll(_:)),
             keyEquivalent: "a"
         )
+        // 値のウインドウや SQL の入力欄など、テキストの中を検索する（検索バーを使うテキストビューが受け取る）
+        editMenu.addItem(.separator())
+        let findItems: [(String, String, NSEvent.ModifierFlags, NSTextFinder.Action)] = [
+            (japanese ? "検索…" : "Find…", "f", [.command], .showFindInterface),
+            (japanese ? "次を検索" : "Find Next", "g", [.command], .nextMatch),
+            (japanese ? "前を検索" : "Find Previous", "g", [.command, .shift], .previousMatch),
+        ]
+        for (title, key, modifiers, action) in findItems {
+            let item = editMenu.addItem(
+                withTitle: title,
+                action: #selector(NSTextView.performFindPanelAction(_:)),
+                keyEquivalent: key
+            )
+            item.keyEquivalentModifierMask = modifiers
+            item.tag = action.rawValue
+        }
+        editMenu.addItem(.separator())
         // 選択した行（選択がなければ全行）を、見出しの行を付けた TSV でコピーする
         let copyWithHeadersItem = editMenu.addItem(
             withTitle: japanese ? "見出し付きでコピー" : "Copy with Headers",
@@ -920,9 +986,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 connectionState = .connected(serverVersion: version)
                 updateTableList()
                 updateDataControls()
+                // 前回見ていたテーブルがあればそれを、なければ先頭を選ぶ。
                 // 選択が変わると tableViewSelectionDidChange から読み込まれる
                 if !tables.isEmpty {
-                    tableListView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+                    let index = savedTableIndex(for: target) ?? 0
+                    tableListView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+                    tableListView.scrollRowToVisible(index)
                 }
             } catch {
                 connectionState = .failed(error)
@@ -991,6 +1060,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     @objc private func tabDidChange(_ sender: NSSegmentedControl) {
         guard SidebarTab.allCases.indices.contains(sender.selectedSegment) else { return }
         sidebarTab = SidebarTab.allCases[sender.selectedSegment]
+        UserDefaults.standard.set(sender.selectedSegment, forKey: Self.sidebarTabKey)
         if sidebarTab == .sql {
             if let selectedTable {
                 prefillQueryIfEmpty(for: selectedTable)
@@ -1623,6 +1693,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     @objc private func languageDidChange(_ sender: NSPopUpButton) {
         language = Language.allCases[sender.indexOfSelectedItem]
+        UserDefaults.standard.set(sender.indexOfSelectedItem, forKey: Self.languageKey)
         updateConnectionUI()
         updateTableListPlaceholder()
         updateMainMenu()
@@ -1797,6 +1868,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard notification.object as? NSTableView === tableListView, let selectedTable else { return }
+        if let connectedTarget {
+            UserDefaults.standard.set(
+                "\(selectedTable.schema)\t\(selectedTable.name)", forKey: lastTableKey(for: connectedTarget)
+            )
+        }
         loadTable(selectedTable)
     }
 
