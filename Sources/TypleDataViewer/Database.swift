@@ -115,6 +115,26 @@ enum Database {
         return TableData(columns: columns, rows: rows)
     }
 
+    /// テーブルの列ごとの名前・型・NOT NULL・既定値。型は integer[] や varchar(255) のように SQL の表記で返す
+    static func fetchSchema(_ table: TableName, on connection: PostgresConnection) async throws -> [[String?]] {
+        let rows = try await connection.query(
+            """
+            SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, pg_get_expr(d.adbin, d.adrelid)
+            FROM pg_attribute a
+            LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+            WHERE a.attrelid = format('%I.%I', \(table.schema), \(table.name))::regclass
+              AND a.attnum > 0 AND NOT a.attisdropped
+            ORDER BY a.attnum
+            """,
+            logger: logger
+        )
+        var columns: [[String?]] = []
+        for try await (name, type, notNull, defaultValue) in rows.decode((String, String, Bool, String?).self) {
+            columns.append([name, type, notNull ? "NOT NULL" : "", defaultValue])
+        }
+        return columns
+    }
+
     private static func quoteIdentifier(_ identifier: String) -> String {
         "\"" + identifier.replacingOccurrences(of: "\"", with: "\"\"") + "\""
     }

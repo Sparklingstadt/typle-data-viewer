@@ -61,6 +61,29 @@ struct FruitRow {
     }
 }
 
+/// 左側パネルのタブ。選んだテーブルの中身を見るか、列の型を見るか
+enum SidebarTab: CaseIterable {
+    case data
+    case schema
+
+    func title(in language: Language) -> String {
+        switch (self, language) {
+        case (.data, .japanese): "データ"
+        case (.data, .english): "Data"
+        case (.schema, .japanese): "スキーマ"
+        case (.schema, .english): "Schema"
+        }
+    }
+
+    /// スキーマを表示するときの列見出し。Database.fetchSchema の列の順に対応する
+    static func schemaColumnTitles(in language: Language) -> [String] {
+        switch language {
+        case .japanese: ["列名", "型", "NOT NULL", "既定値"]
+        case .english: ["Column", "Type", "NOT NULL", "Default"]
+        }
+    }
+}
+
 /// DB から読んだ1行。ソート後も同値の行を元の順に並べるため、取得時の順番を持つ
 struct DatabaseRow {
     let order: Int
@@ -74,6 +97,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     /// 左側に縦に並べる DB テーブルの一覧
     private var tableListView: NSTableView!
     private var tableListPlaceholder: NSTextField!
+    private var tabControl: NSSegmentedControl!
+    private var sidebarTab: SidebarTab = .data
+    /// 右の表にいまスキーマを出しているか。言語を切り替えたときに見出しを付け直すのに使う
+    private var isShowingSchema = false
     private var connectButton: NSButton!
     private var statusLabel: NSTextField!
     private var language: Language = .japanese
@@ -192,11 +219,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         ])
         updateTableListPlaceholder()
 
+        tabControl = NSSegmentedControl(
+            labels: SidebarTab.allCases.map { $0.title(in: language) },
+            trackingMode: .selectOne,
+            target: self,
+            action: #selector(tabDidChange(_:))
+        )
+        tabControl.selectedSegment = SidebarTab.allCases.firstIndex(of: sidebarTab) ?? 0
+        tabControl.segmentDistribution = .fillEqually
+        tabControl.translatesAutoresizingMaskIntoConstraints = false
+
+        // 左側パネルは、先頭にタブ、その下にテーブルの一覧
+        let sidebar = NSView()
+        sidebar.addSubview(tabControl)
+        sidebar.addSubview(listScrollView)
+        NSLayoutConstraint.activate([
+            tabControl.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 8),
+            tabControl.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 8),
+            tabControl.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -8),
+            listScrollView.topAnchor.constraint(equalTo: tabControl.bottomAnchor, constant: 8),
+            listScrollView.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+            listScrollView.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            listScrollView.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
+        ])
+
         // 左に一覧、右に表。ウインドウを広げたときは表の側が伸びる
         let splitView = NSSplitView()
         splitView.isVertical = true
         splitView.dividerStyle = .thin
-        splitView.addArrangedSubview(listScrollView)
+        splitView.addArrangedSubview(sidebar)
         splitView.addArrangedSubview(scrollView)
         splitView.setHoldingPriority(.defaultLow + 1, forSubviewAt: 0)
         splitView.translatesAutoresizingMaskIntoConstraints = false
@@ -226,7 +277,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             splitView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             splitView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
 
-            listScrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 140),
+            sidebar.widthAnchor.constraint(greaterThanOrEqualToConstant: 140),
             scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 240),
         ])
         window.contentView = contentView
@@ -385,13 +436,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         tables.indices.contains(tableListView.selectedRow) ? tables[tableListView.selectedRow] : nil
     }
 
+    @objc private func tabDidChange(_ sender: NSSegmentedControl) {
+        guard SidebarTab.allCases.indices.contains(sender.selectedSegment) else { return }
+        sidebarTab = SidebarTab.allCases[sender.selectedSegment]
+        if let selectedTable {
+            loadTable(selectedTable)
+        }
+    }
+
     private func loadTable(_ table: TableName) {
         guard let connection else { return }
+        let tab = sidebarTab
         Task {
             do {
-                let data = try await Database.fetchTable(table, on: connection)
-                // 読み込み中に別のテーブルが選ばれていたら、古い結果は捨てる
-                guard self.connection === connection, selectedTable == table else { return }
+                let data: TableData
+                switch tab {
+                case .data:
+                    data = try await Database.fetchTable(table, on: connection)
+                case .schema:
+                    data = TableData(
+                        columns: SidebarTab.schemaColumnTitles(in: language),
+                        rows: try await Database.fetchSchema(table, on: connection)
+                    )
+                }
+                // 読み込み中に別のテーブルやタブが選ばれていたら、古い結果は捨てる
+                guard self.connection === connection, selectedTable == table, sidebarTab == tab else { return }
+                isShowingSchema = tab == .schema
                 databaseColumns = data.columns
                 databaseRows = data.rows.enumerated().map { DatabaseRow(order: $0.offset, values: $0.element) }
                 rebuildColumns()
@@ -408,6 +478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func showSampleData() {
+        isShowingSchema = false
         databaseColumns = nil
         databaseRows = []
         rebuildColumns()
@@ -450,12 +521,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         updateConnectionUI()
         updateTableListPlaceholder()
         updateMainMenu()
+        for (index, tab) in SidebarTab.allCases.enumerated() {
+            tabControl.setLabel(tab.title(in: language), forSegment: index)
+        }
+        if isShowingSchema {
+            updateSchemaColumnTitles()
+        }
         if databaseColumns == nil {
             updateColumnTitles()
             // 果物名は言語で並び順が変わるので、現在のソートをかけ直す
             sortRows()
             tableView.reloadData()
         }
+    }
+
+    private func updateSchemaColumnTitles() {
+        let titles = SidebarTab.schemaColumnTitles(in: language)
+        databaseColumns = titles
+        for tableColumn in tableView.tableColumns {
+            guard let index = Int(tableColumn.identifier.rawValue.dropFirst(Self.databaseColumnPrefix.count)),
+                  titles.indices.contains(index) else { continue }
+            tableColumn.title = titles[index]
+        }
+        tableView.headerView?.needsDisplay = true
     }
 
     private func updateColumnTitles() {
