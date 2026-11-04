@@ -92,6 +92,13 @@ struct ForeignKeyJump {
     let filters: [ColumnFilter]
 }
 
+/// テーブルごとに覚えておく列の見た目。列は名前で持つので、列が増減しても残りの列には効く
+struct ColumnLayout: Codable {
+    var order: [String] = []
+    var widths: [String: Double] = [:]
+    var hidden: [String] = []
+}
+
 /// DB から読んだ1行。ソート後も同値の行を元の順に並べるため、取得時の順番を持つ
 struct DatabaseRow {
     let order: Int
@@ -257,6 +264,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         cellMenu.autoenablesItems = false
         cellMenu.delegate = self
         tableView.menu = cellMenu
+        // 見出しを右クリックすると、列の表示・非表示を切り替えられる
+        let headerMenu = NSMenu()
+        headerMenu.autoenablesItems = false
+        headerMenu.delegate = self
+        tableView.headerView?.menu = headerMenu
         rebuildColumns()
 
         let scrollView = NSScrollView()
@@ -579,7 +591,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     /// 表に出している内容を、見えている列の順・並べ替えた順のまま取り出す。
     /// - Parameter rowIndexes: 取り出す行。nil なら全行
     private func displayedContent(rowIndexes: IndexSet? = nil) -> (columns: [String], rows: [[String?]]) {
-        let tableColumns = tableView.tableColumns
+        // 隠した列は書き出さない
+        let tableColumns = tableView.tableColumns.filter { !$0.isHidden }
         let indexes = rowIndexes ?? IndexSet(integersIn: 0..<tableView.numberOfRows)
         let rows = indexes.map { row in
             tableColumns.map { column -> String? in
@@ -985,6 +998,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     /// 右クリックしたセルに合わせたメニュー。「値を開く」と、その列を含む外部キーごとの「参照先を開く」
     func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === tableView.headerView?.menu {
+            updateHeaderMenu(menu)
+            return
+        }
         guard menu === tableView.menu else { return }
         menu.removeAllItems()
         let row = tableView.clickedRow
@@ -1236,6 +1253,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 tableColumn.sortDescriptorPrototype = NSSortDescriptor(key: key, ascending: true)
                 tableView.addTableColumn(tableColumn)
             }
+            // データタブでは、このテーブルで前に変えた列の並び・幅・表示を戻す
+            if isShowingDatabaseData, let displayedTable, let layout = loadColumnLayout(for: displayedTable) {
+                apply(layout, columnNames: databaseColumns)
+            }
             // データタブに戻ったときなど、サーバー側でかけている並べ替えを見出しの矢印に反映する
             if !isShowingSchema, !isShowingQueryResult, let sortColumn = dataQuery.sortColumn,
                let index = databaseColumns.firstIndex(of: sortColumn) {
@@ -1251,6 +1272,132 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             }
             updateColumnTitles()
         }
+    }
+
+    // MARK: - Column layout
+
+    /// 列の識別子（db.0 など）に対応する DB の列名
+    private func databaseColumnName(for identifier: NSUserInterfaceItemIdentifier) -> String? {
+        guard let databaseColumns,
+              let index = Int(identifier.rawValue.dropFirst(Self.databaseColumnPrefix.count)),
+              databaseColumns.indices.contains(index) else { return nil }
+        return databaseColumns[index]
+    }
+
+    private static func columnLayoutKey(for table: TableName) -> String {
+        "columnLayout.\(table.schema).\(table.name)"
+    }
+
+    private func loadColumnLayout(for table: TableName) -> ColumnLayout? {
+        guard let data = UserDefaults.standard.data(forKey: Self.columnLayoutKey(for: table)) else { return nil }
+        return try? JSONDecoder().decode(ColumnLayout.self, from: data)
+    }
+
+    /// いまの列の並び・幅・表示を、表示中のテーブルの分として保存する。データタブのときだけ
+    private func saveColumnLayout() {
+        guard !isRebuildingColumns, isShowingDatabaseData, let displayedTable else { return }
+        var layout = ColumnLayout()
+        for tableColumn in tableView.tableColumns {
+            guard let name = databaseColumnName(for: tableColumn.identifier) else { continue }
+            layout.order.append(name)
+            layout.widths[name] = Double(tableColumn.width)
+            if tableColumn.isHidden {
+                layout.hidden.append(name)
+            }
+        }
+        guard let data = try? JSONEncoder().encode(layout) else { return }
+        UserDefaults.standard.set(data, forKey: Self.columnLayoutKey(for: displayedTable))
+    }
+
+    /// 保存してあった並び・幅・表示を、作ったばかりの列に当てる。rebuildColumns の中から呼ぶ
+    private func apply(_ layout: ColumnLayout, columnNames: [String]) {
+        // 保存した順に並べ、保存後に増えた列は元の順で後ろに続ける
+        let savedOrder = layout.order.filter { columnNames.contains($0) }
+        let desiredOrder = savedOrder + columnNames.filter { !savedOrder.contains($0) }
+        for (target, name) in desiredOrder.enumerated() {
+            guard let current = tableView.tableColumns.firstIndex(where: {
+                databaseColumnName(for: $0.identifier) == name
+            }), current != target else { continue }
+            tableView.moveColumn(current, toColumn: target)
+        }
+        for tableColumn in tableView.tableColumns {
+            guard let name = databaseColumnName(for: tableColumn.identifier) else { continue }
+            if let width = layout.widths[name] {
+                tableColumn.width = CGFloat(width)
+            }
+            tableColumn.isHidden = layout.hidden.contains(name)
+        }
+        // すべて隠れていると何も見えなくなるので、そのときは全部出す
+        if tableView.tableColumns.allSatisfy(\.isHidden) {
+            tableView.tableColumns.forEach { $0.isHidden = false }
+        }
+    }
+
+    /// 見出しの右クリックメニュー。列ごとのチェックと、すべて表示・元に戻す
+    private func updateHeaderMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let japanese = language == .japanese
+        let visibleCount = tableView.tableColumns.filter { !$0.isHidden }.count
+        for tableColumn in tableView.tableColumns {
+            let item = NSMenuItem(
+                title: tableColumn.title,
+                action: #selector(toggleColumnVisibilityMenuItemSelected(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.state = tableColumn.isHidden ? .off : .on
+            item.representedObject = tableColumn.identifier
+            // 最後の1列は隠せない
+            item.isEnabled = tableColumn.isHidden || visibleCount > 1
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let showAllItem = NSMenuItem(
+            title: japanese ? "すべての列を表示" : "Show All Columns",
+            action: #selector(showAllColumnsMenuItemSelected(_:)),
+            keyEquivalent: ""
+        )
+        showAllItem.target = self
+        showAllItem.isEnabled = visibleCount < tableView.tableColumns.count
+        menu.addItem(showAllItem)
+        let resetItem = NSMenuItem(
+            title: japanese ? "列の並び・幅・表示を元に戻す" : "Reset Column Layout",
+            action: #selector(resetColumnLayoutMenuItemSelected(_:)),
+            keyEquivalent: ""
+        )
+        resetItem.target = self
+        resetItem.isEnabled = isShowingDatabaseData
+        menu.addItem(resetItem)
+    }
+
+    @objc private func toggleColumnVisibilityMenuItemSelected(_ sender: NSMenuItem) {
+        guard let identifier = sender.representedObject as? NSUserInterfaceItemIdentifier,
+              let tableColumn = tableView.tableColumn(withIdentifier: identifier) else { return }
+        tableColumn.isHidden.toggle()
+        saveColumnLayout()
+    }
+
+    @objc private func showAllColumnsMenuItemSelected(_ sender: Any?) {
+        tableView.tableColumns.forEach { $0.isHidden = false }
+        saveColumnLayout()
+    }
+
+    /// 保存した見た目を消して、列を作り直す
+    @objc private func resetColumnLayoutMenuItemSelected(_ sender: Any?) {
+        guard isShowingDatabaseData, let displayedTable else { return }
+        UserDefaults.standard.removeObject(forKey: Self.columnLayoutKey(for: displayedTable))
+        rebuildColumns()
+        tableView.reloadData()
+    }
+
+    func tableViewColumnDidResize(_ notification: Notification) {
+        guard notification.object as? NSTableView === tableView else { return }
+        saveColumnLayout()
+    }
+
+    func tableViewColumnDidMove(_ notification: Notification) {
+        guard notification.object as? NSTableView === tableView else { return }
+        saveColumnLayout()
     }
 
     @objc private func languageDidChange(_ sender: NSPopUpButton) {

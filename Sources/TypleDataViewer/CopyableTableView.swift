@@ -8,9 +8,9 @@ final class CopyableTableView: NSTableView {
 
     @objc func copy(_ sender: Any?) {
         guard let copyValue, !selectedRowIndexes.isEmpty else { return }
-        // 列は見出しをドラッグで並べ替えられるので、いま見えている順で並べる
+        // 列は見出しをドラッグで並べ替えられるので、いま見えている順で並べる。隠した列は入れない
         let lines = selectedRowIndexes.map { row in
-            tableColumns.map { TableExporter.tsvField(copyValue(row, $0.identifier) ?? "") }.joined(separator: "\t")
+            tableColumns.filter { !$0.isHidden }.map { TableExporter.tsvField(copyValue(row, $0.identifier) ?? "") }.joined(separator: "\t")
         }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(lines.joined(separator: "\n"), forType: .string)
