@@ -34,6 +34,15 @@ struct TableQuery: Equatable, Sendable {
     var offset = 0
 }
 
+/// スキーマタブの内容。columns は列ごとに 名前・型・NOT NULL・既定値・キー
+struct TableSchema: Sendable {
+    let columns: [[String?]]
+    let estimatedRowCount: Int?
+    let tableSize: String
+    let totalSize: String
+    let indexes: [String]
+}
+
 /// SQL 欄で実行した結果。行数の上限を超えた分は読まず、isTruncated を立てる
 struct QueryResult: Sendable {
     let columns: [String]
@@ -186,11 +195,39 @@ enum Database {
         return TablePage(columns: columns, rows: rows, totalCount: totalCount)
     }
 
-    /// テーブルの列ごとの名前・型・NOT NULL・既定値。型は integer[] や varchar(255) のように SQL の表記で返す
-    static func fetchSchema(_ table: TableName, on connection: PostgresConnection) async throws -> [[String?]] {
+    /// スキーマタブに出す内容をまとめて読む
+    static func fetchSchema(_ table: TableName, on connection: PostgresConnection) async throws -> TableSchema {
+        let columns = try await fetchSchemaColumns(table, on: connection)
+        let summary = try await fetchTableSummary(table, on: connection)
+        let indexes = try await fetchIndexes(table, on: connection)
+        return TableSchema(
+            columns: columns,
+            estimatedRowCount: summary.estimatedRowCount,
+            tableSize: summary.tableSize,
+            totalSize: summary.totalSize,
+            indexes: indexes
+        )
+    }
+
+    /// テーブルの列ごとの名前・型・NOT NULL・既定値・キー。型は integer[] や varchar(255) のように SQL の表記で返す。
+    /// キーはその列を含む制約で、PK・UNIQUE・FK → 参照先テーブル(列) をカンマ区切りで並べる
+    private static func fetchSchemaColumns(_ table: TableName, on connection: PostgresConnection) async throws -> [[String?]] {
         let rows = try await connection.query(
             """
-            SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, pg_get_expr(d.adbin, d.adrelid)
+            SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, pg_get_expr(d.adbin, d.adrelid),
+              (SELECT string_agg(
+                  CASE c.contype
+                    WHEN 'p' THEN 'PK'
+                    WHEN 'u' THEN 'UNIQUE'
+                    ELSE 'FK → ' || c.confrelid::regclass::text || '(' || (
+                      SELECT string_agg(quote_ident(fa.attname), ', ' ORDER BY k.ord)
+                      FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
+                      JOIN pg_attribute fa ON fa.attrelid = c.confrelid AND fa.attnum = k.attnum
+                    ) || ')'
+                  END,
+                  ', ' ORDER BY CASE c.contype WHEN 'p' THEN 0 WHEN 'u' THEN 1 ELSE 2 END, c.conname)
+               FROM pg_constraint c
+               WHERE c.conrelid = a.attrelid AND a.attnum = ANY (c.conkey) AND c.contype IN ('p', 'u', 'f'))
             FROM pg_attribute a
             LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
             WHERE a.attrelid = format('%I.%I', \(table.schema), \(table.name))::regclass
@@ -200,10 +237,50 @@ enum Database {
             logger: logger
         )
         var columns: [[String?]] = []
-        for try await (name, type, notNull, defaultValue) in rows.decode((String, String, Bool, String?).self) {
-            columns.append([name, type, notNull ? "NOT NULL" : "", defaultValue])
+        for try await (name, type, notNull, defaultValue, keys) in rows.decode(
+            (String, String, Bool, String?, String?).self
+        ) {
+            columns.append([name, type, notNull ? "NOT NULL" : "", defaultValue, keys])
         }
         return columns
+    }
+
+    /// 統計上の推定行数と、テーブル単体・インデックスなどを含めた大きさ。
+    /// 推定行数は一度も ANALYZE されていないと -1 になるので、そのときは nil にする
+    private static func fetchTableSummary(
+        _ table: TableName, on connection: PostgresConnection
+    ) async throws -> (estimatedRowCount: Int?, tableSize: String, totalSize: String) {
+        let rows = try await connection.query(
+            """
+            SELECT c.reltuples::bigint, pg_size_pretty(pg_table_size(c.oid)), pg_size_pretty(pg_total_relation_size(c.oid))
+            FROM pg_class c
+            WHERE c.oid = format('%I.%I', \(table.schema), \(table.name))::regclass
+            """,
+            logger: logger
+        )
+        for try await (rowCount, tableSize, totalSize) in rows.decode((Int, String, String).self) {
+            return (rowCount >= 0 ? rowCount : nil, tableSize, totalSize)
+        }
+        return (nil, "?", "?")
+    }
+
+    /// インデックスの定義（CREATE INDEX … の形）。主キー、UNIQUE、その他の順
+    private static func fetchIndexes(_ table: TableName, on connection: PostgresConnection) async throws -> [String] {
+        let rows = try await connection.query(
+            """
+            SELECT pg_get_indexdef(i.indexrelid)
+            FROM pg_index i
+            JOIN pg_class ic ON ic.oid = i.indexrelid
+            WHERE i.indrelid = format('%I.%I', \(table.schema), \(table.name))::regclass
+            ORDER BY i.indisprimary DESC, i.indisunique DESC, ic.relname
+            """,
+            logger: logger
+        )
+        var indexes: [String] = []
+        for try await definition in rows.decode(String.self) {
+            indexes.append(definition)
+        }
+        return indexes
     }
 
     // MARK: - SQL query

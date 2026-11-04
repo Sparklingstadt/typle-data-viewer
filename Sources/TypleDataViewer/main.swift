@@ -80,8 +80,8 @@ enum SidebarTab: CaseIterable {
     /// スキーマを表示するときの列見出し。Database.fetchSchema の列の順に対応する
     static func schemaColumnTitles(in language: Language) -> [String] {
         switch language {
-        case .japanese: ["列名", "型", "NOT NULL", "既定値"]
-        case .english: ["Column", "Type", "NOT NULL", "Default"]
+        case .japanese: ["列名", "型", "NOT NULL", "既定値", "キー"]
+        case .english: ["Column", "Type", "NOT NULL", "Default", "Keys"]
         }
     }
 }
@@ -138,6 +138,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var totalRowCount = 0
     /// 読み込みを始めるたびに増やす。追い越された古い結果を捨てるのに使う
     private var loadGeneration = 0
+
+    // スキーマタブで表の上に出す、推定行数・大きさ・インデックス
+    private var schemaInfoBar: NSStackView!
+    private var schemaSummaryLabel: NSTextField!
+    private var schemaIndexesLabel: NSTextField!
+    /// 表示中のスキーマ。言語を切り替えたときに文言を作り直すのに使う
+    private var displayedSchema: TableSchema?
 
     // SQL タブ。表の上に SQL の入力欄と実行ボタンを出し、結果を同じ表に出す
     private var sqlBar: NSStackView!
@@ -298,7 +305,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         sqlBar.spacing = 6
         sqlBar.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
 
-        let dataPane = NSStackView(views: [filterBar, sqlBar, scrollView, pagingBar])
+        schemaSummaryLabel = NSTextField(labelWithString: "")
+        schemaSummaryLabel.lineBreakMode = .byTruncatingTail
+        schemaSummaryLabel.isSelectable = true
+        schemaSummaryLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        // インデックスは1行に1つ。多いときは数行で切り、全部はツールチップで見られる
+        schemaIndexesLabel = NSTextField(wrappingLabelWithString: "")
+        schemaIndexesLabel.font = .monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        schemaIndexesLabel.textColor = .secondaryLabelColor
+        schemaIndexesLabel.maximumNumberOfLines = 6
+        schemaIndexesLabel.lineBreakMode = .byTruncatingTail
+        schemaIndexesLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        schemaInfoBar = NSStackView(views: [schemaSummaryLabel, schemaIndexesLabel])
+        schemaInfoBar.orientation = .vertical
+        schemaInfoBar.alignment = .leading
+        schemaInfoBar.spacing = 4
+        schemaInfoBar.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
+
+        let dataPane = NSStackView(views: [filterBar, sqlBar, schemaInfoBar, scrollView, pagingBar])
         dataPane.orientation = .vertical
         dataPane.alignment = .width
         dataPane.spacing = 0
@@ -738,16 +762,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             do {
                 let data: TableData
                 var totalCount = 0
+                var schema: TableSchema?
                 switch tab {
                 case .data:
                     let page = try await Database.fetchTable(table, query: query, on: connection)
                     data = TableData(columns: page.columns, rows: page.rows)
                     totalCount = page.totalCount
                 case .schema:
-                    data = TableData(
-                        columns: SidebarTab.schemaColumnTitles(in: language),
-                        rows: try await Database.fetchSchema(table, on: connection)
-                    )
+                    let fetched = try await Database.fetchSchema(table, on: connection)
+                    schema = fetched
+                    data = TableData(columns: SidebarTab.schemaColumnTitles(in: language), rows: fetched.columns)
                 case .sql:
                     return
                 }
@@ -768,6 +792,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                     || isShowingQueryResult || databaseColumns != data.columns
                 isShowingSchema = tab == .schema
                 isShowingQueryResult = false
+                displayedSchema = schema
                 displayedTable = table
                 displayedOffset = query.offset
                 totalRowCount = totalCount
@@ -807,6 +832,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func showSampleData() {
         isShowingSchema = false
+        displayedSchema = nil
         isShowingQueryResult = false
         displayedTable = nil
         databaseColumns = nil
@@ -834,6 +860,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         runQueryButton.isEnabled = connection != nil && !isRunningQuery
         sqlBar.isHidden = sidebarTab != .sql
         updateQueryStatusLabel()
+        updateSchemaInfo()
 
         filterBar.isHidden = !isShowingDatabaseData
         pagingBar.isHidden = !isShowingDatabaseData
@@ -871,6 +898,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private static func formatCount(_ count: Int) -> String {
         countFormatter.string(from: NSNumber(value: count)) ?? String(count)
+    }
+
+    /// スキーマタブの上の欄。推定行数と大きさ、その下にインデックスの定義を並べる
+    private func updateSchemaInfo() {
+        guard isShowingSchema, let displayedSchema else {
+            schemaInfoBar.isHidden = true
+            return
+        }
+        schemaInfoBar.isHidden = false
+        let japanese = language == .japanese
+        let rowCount = displayedSchema.estimatedRowCount.map(Self.formatCount)
+        let rowsText = japanese
+            ? "推定 \(rowCount ?? "不明") 行"
+            : "About \(rowCount ?? "unknown") rows"
+        let sizeText = japanese
+            ? "データ \(displayedSchema.tableSize) · インデックス等を含め \(displayedSchema.totalSize)"
+            : "Data \(displayedSchema.tableSize) · \(displayedSchema.totalSize) including indexes"
+        schemaSummaryLabel.stringValue = "\(rowsText) · \(sizeText)"
+
+        let indexes = displayedSchema.indexes
+        let indexesText = indexes.isEmpty
+            ? (japanese ? "インデックスなし" : "No indexes")
+            : indexes.joined(separator: "\n")
+        schemaIndexesLabel.stringValue = indexesText
+        schemaIndexesLabel.toolTip = indexes.isEmpty ? nil : indexesText
     }
 
     /// 検索語か対象の列が変わったら、先頭のページから読み直す
