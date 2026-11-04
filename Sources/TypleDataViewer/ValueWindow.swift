@@ -1,7 +1,7 @@
 import AppKit
 
 /// セルの値を全文で見るためのウインドウ。表のセルは1行に切り詰めて表示しているので、長い値はここで読む。
-/// JSON のオブジェクトや配列は、テキストではなく表にして見せる
+/// JSON のオブジェクトや配列は、表と、整形したテキストを切り替えて見られる。テキストは Cmd+F で検索できる
 @MainActor
 final class ValueWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
     /// 開いているウインドウを保持する。閉じたら外す
@@ -11,6 +11,11 @@ final class ValueWindowController: NSWindowController, NSTableViewDataSource, NS
     private let language: Language
     /// JSON を表で見せているときの中身。テキスト表示のときは nil
     private var jsonTable: JSONTable?
+    /// JSON のときの、表とテキストの入れ物。切り替えボタンで片方だけ見せる
+    private var jsonTableView: NSView?
+    private var jsonTextView: NSView?
+    /// 最後に選んだ JSON の見せ方。次に開くウインドウもそれに合わせる
+    private static var showsJSONAsText = false
 
     static func show(title: String, value: String?, language: Language) {
         let controller = ValueWindowController(title: title, value: value, language: language)
@@ -35,27 +40,36 @@ final class ValueWindowController: NSWindowController, NSTableViewDataSource, NS
 
         super.init(window: window)
 
-        if let jsonTable {
-            let scrollView = makeTableScrollView(for: jsonTable)
-            window.contentView = scrollView
-            window.initialFirstResponder = scrollView.documentView
+        if let jsonTable, let container {
+            // 表と、整形した JSON のテキストを切り替えて見せる
+            let tableScrollView = makeTableScrollView(for: jsonTable)
+            let textScrollView = Self.makeTextScrollView(text: Self.prettyPrinted(container) ?? value ?? "")
+            jsonTableView = tableScrollView
+            jsonTextView = textScrollView
+
+            let modeControl = NSSegmentedControl(
+                labels: language == .japanese ? ["表", "テキスト"] : ["Table", "Text"],
+                trackingMode: .selectOne,
+                target: nil,
+                action: nil
+            )
+            modeControl.selectedSegment = Self.showsJSONAsText ? 1 : 0
+            let modeBar = NSStackView(views: [modeControl])
+            modeBar.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
+
+            let stack = NSStackView(views: [modeBar, tableScrollView, textScrollView])
+            stack.orientation = .vertical
+            stack.alignment = .width
+            stack.spacing = 0
+            window.contentView = stack
+            modeControl.target = self
+            modeControl.action = #selector(jsonModeDidChange(_:))
+            showJSON(asText: Self.showsJSONAsText)
         } else {
-            let scrollView = NSTextView.scrollableTextView()
-            let textView = scrollView.documentView as! NSTextView
-            textView.isEditable = false
-            textView.isSelectable = true
-            textView.font = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-            textView.textContainerInset = NSSize(width: 8, height: 8)
-            if let value {
-                textView.string = value
-                textView.textColor = .labelColor
-            } else {
-                textView.string = "NULL"
-                textView.textColor = .tertiaryLabelColor
-            }
+            let scrollView = Self.makeTextScrollView(text: value ?? "NULL", isNull: value == nil)
             window.contentView = scrollView
             // 開いてすぐ Cmd+A で全選択できるよう、最初からテキストにフォーカスを置く
-            window.initialFirstResponder = textView
+            window.initialFirstResponder = scrollView.documentView
         }
 
         // 開いた順に少しずつずらして、重なっても見分けられるようにする
@@ -76,6 +90,42 @@ final class ValueWindowController: NSWindowController, NSTableViewDataSource, NS
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    /// 読み取り専用のテキスト表示。Cmd+F で検索バーを出せる
+    private static func makeTextScrollView(text: String, isNull: Bool = false) -> NSScrollView {
+        let scrollView = NSTextView.scrollableTextView()
+        let textView = scrollView.documentView as! NSTextView
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.font = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+        textView.usesFindBar = true
+        textView.isIncrementalSearchingEnabled = true
+        textView.string = text
+        textView.textColor = isNull ? .tertiaryLabelColor : .labelColor
+        return scrollView
+    }
+
+    /// インデントを付けた JSON。キーは名前順（表の並びと同じ）
+    private static func prettyPrinted(_ container: Any) -> String? {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: container, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        ) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    @objc private func jsonModeDidChange(_ sender: NSSegmentedControl) {
+        Self.showsJSONAsText = sender.selectedSegment == 1
+        showJSON(asText: Self.showsJSONAsText)
+    }
+
+    private func showJSON(asText: Bool) {
+        jsonTableView?.isHidden = asText
+        jsonTextView?.isHidden = !asText
+        let focus = (asText ? jsonTextView : jsonTableView) as? NSScrollView
+        window?.makeFirstResponder(focus?.documentView)
+        window?.initialFirstResponder = focus?.documentView
     }
 
     /// JSON（jsonb の列など）のオブジェクトか配列なら、その中身を返す。それ以外は nil
