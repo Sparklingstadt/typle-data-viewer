@@ -61,10 +61,11 @@ struct FruitRow {
     }
 }
 
-/// 左側パネルのタブ。選んだテーブルの中身を見るか、列の型を見るか
+/// 左側パネルのタブ。選んだテーブルの中身を見るか、列の型を見るか、SQL を書いて実行するか
 enum SidebarTab: CaseIterable {
     case data
     case schema
+    case sql
 
     func title(in language: Language) -> String {
         switch (self, language) {
@@ -72,6 +73,7 @@ enum SidebarTab: CaseIterable {
         case (.data, .english): "Data"
         case (.schema, .japanese): "スキーマ"
         case (.schema, .english): "Schema"
+        case (.sql, _): "SQL"
         }
     }
 
@@ -91,7 +93,8 @@ struct DatabaseRow {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate,
+    NSMenuItemValidation {
     private var window: NSWindow!
     private var tableView: CopyableTableView!
     /// 左側に縦に並べる DB テーブルの一覧
@@ -135,6 +138,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var totalRowCount = 0
     /// 読み込みを始めるたびに増やす。追い越された古い結果を捨てるのに使う
     private var loadGeneration = 0
+
+    // SQL タブ。表の上に SQL の入力欄と実行ボタンを出し、結果を同じ表に出す
+    private var sqlBar: NSStackView!
+    private var sqlTextView: NSTextView!
+    private var runQueryButton: NSButton!
+    private var queryStatusLabel: NSTextField!
+    /// 表にいま SQL の実行結果を出しているか
+    private var isShowingQueryResult = false
+    private var isRunningQuery = false
+    /// 最後に成功した実行結果と、かかった秒数。SQL タブに戻ったときにまた出す
+    private var lastQueryResult: QueryResult?
+    private var lastQueryDuration: TimeInterval = 0
+    /// 実行するたびに増やす。追い越された古い結果を捨てるのに使う
+    private var queryGeneration = 0
 
     private static let countFormatter: NumberFormatter = {
         let formatter = NumberFormatter()
@@ -246,7 +263,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         pagingBar.addView(previousPageButton, in: .trailing)
         pagingBar.addView(nextPageButton, in: .trailing)
 
-        let dataPane = NSStackView(views: [filterBar, scrollView, pagingBar])
+        let sqlScrollView = NSTextView.scrollableTextView()
+        sqlScrollView.borderType = .bezelBorder
+        sqlScrollView.translatesAutoresizingMaskIntoConstraints = false
+        sqlScrollView.heightAnchor.constraint(equalToConstant: 120).isActive = true
+        sqlTextView = sqlScrollView.documentView as? NSTextView
+        sqlTextView.font = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        sqlTextView.isRichText = false
+        sqlTextView.allowsUndo = true
+        // SQL の引用符やハイフンが勝手に置き換わらないようにする
+        sqlTextView.isAutomaticQuoteSubstitutionEnabled = false
+        sqlTextView.isAutomaticDashSubstitutionEnabled = false
+        sqlTextView.isAutomaticTextReplacementEnabled = false
+        sqlTextView.isAutomaticSpellingCorrectionEnabled = false
+        sqlTextView.isContinuousSpellCheckingEnabled = false
+
+        queryStatusLabel = NSTextField(labelWithString: "")
+        queryStatusLabel.textColor = .secondaryLabelColor
+        queryStatusLabel.lineBreakMode = .byTruncatingTail
+        queryStatusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        // 入力欄にフォーカスがあっても Cmd+Return で実行できる
+        runQueryButton = NSButton(title: "", target: self, action: #selector(runQueryClicked(_:)))
+        runQueryButton.keyEquivalent = "\r"
+        runQueryButton.keyEquivalentModifierMask = .command
+        let queryControls = NSStackView()
+        queryControls.orientation = .horizontal
+        queryControls.spacing = 8
+        queryControls.addView(queryStatusLabel, in: .leading)
+        queryControls.addView(runQueryButton, in: .trailing)
+
+        sqlBar = NSStackView(views: [sqlScrollView, queryControls])
+        sqlBar.orientation = .vertical
+        sqlBar.alignment = .width
+        sqlBar.spacing = 6
+        sqlBar.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
+
+        let dataPane = NSStackView(views: [filterBar, sqlBar, scrollView, pagingBar])
         dataPane.orientation = .vertical
         dataPane.alignment = .width
         dataPane.spacing = 0
@@ -401,11 +453,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let editMenuItem = NSMenuItem()
         editMenuItem.submenu = editMenu
 
+        // 値のウインドウが前面にあっても、メインの表を読み直す
+        let viewMenu = NSMenu(title: japanese ? "表示" : "View")
+        let reloadItem = viewMenu.addItem(
+            withTitle: japanese ? "再読み込み" : "Reload",
+            action: #selector(reloadMenuItemSelected(_:)),
+            keyEquivalent: "r"
+        )
+        reloadItem.target = self
+        let viewMenuItem = NSMenuItem()
+        viewMenuItem.submenu = viewMenu
+
         let mainMenu = NSMenu()
         mainMenu.addItem(appMenuItem)
         mainMenu.addItem(fileMenuItem)
         mainMenu.addItem(editMenuItem)
+        mainMenu.addItem(viewMenuItem)
         NSApp.mainMenu = mainMenu
+    }
+
+    /// 接続し直さずに、選択中のテーブルをいまの条件（絞り込み・並べ替え・ページ・タブ）のまま読み直す
+    @objc private func reloadMenuItemSelected(_ sender: Any?) {
+        // SQL タブでは、書いてある SQL を実行し直す
+        if sidebarTab == .sql {
+            runQuery()
+            return
+        }
+        guard let selectedTable else { return }
+        loadTable(selectedTable, keepsScrollPosition: true)
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(reloadMenuItemSelected(_:)) {
+            return connection != nil && (sidebarTab == .sql || selectedTable != nil)
+        }
+        return true
     }
 
     // MARK: - Connection
@@ -436,6 +518,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 self.tables = tables
                 connectionState = .connected(serverVersion: version)
                 updateTableList()
+                updateDataControls()
                 // 選択が変わると tableViewSelectionDidChange から読み込まれる
                 if !tables.isEmpty {
                     tableListView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
@@ -453,6 +536,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         queryTable = nil
         dataQuery = TableQuery()
         searchField.stringValue = ""
+        lastQueryResult = nil
         connectionState = .disconnected
         updateTableList()
         showSampleData()
@@ -501,14 +585,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     @objc private func tabDidChange(_ sender: NSSegmentedControl) {
         guard SidebarTab.allCases.indices.contains(sender.selectedSegment) else { return }
         sidebarTab = SidebarTab.allCases[sender.selectedSegment]
+        if sidebarTab == .sql {
+            if let selectedTable {
+                prefillQueryIfEmpty(for: selectedTable)
+            }
+            showQueryResult()
+            window.makeFirstResponder(sqlTextView)
+            return
+        }
         if let selectedTable {
             loadTable(selectedTable)
+        } else if isShowingQueryResult {
+            showSampleData()
         }
+        updateDataControls()
     }
 
-    private func loadTable(_ table: TableName) {
+    /// - Parameter keepsScrollPosition: 再読み込みのとき、同じテーブル・ページならスクロール位置を保つ
+    private func loadTable(_ table: TableName, keepsScrollPosition: Bool = false) {
         guard let connection else { return }
         let tab = sidebarTab
+        // SQL タブではテーブルを読まない。入力欄が空なら、そのテーブルを見る SELECT を入れておく
+        if tab == .sql {
+            prefillQueryIfEmpty(for: table)
+            return
+        }
         if table != queryTable {
             // 別のテーブルに移ったら、絞り込み・並べ替え・ページを最初に戻す
             queryTable = table
@@ -532,14 +633,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                         columns: SidebarTab.schemaColumnTitles(in: language),
                         rows: try await Database.fetchSchema(table, on: connection)
                     )
+                case .sql:
+                    return
                 }
                 // 読み込み中に別のテーブルやタブ、条件が選ばれていたら、古い結果は捨てる
                 guard generation == loadGeneration, self.connection === connection,
                       selectedTable == table, sidebarTab == tab else { return }
+                // 再読み込みで行が減り、いまのページが範囲外になったら最後のページを読み直す
+                if tab == .data, data.rows.isEmpty, query.offset > 0, totalCount > 0 {
+                    dataQuery.offset = (totalCount - 1) / Database.pageSize * Database.pageSize
+                    loadTable(table)
+                    return
+                }
+                let keepsScroll = keepsScrollPosition && displayedTable == table
+                    && isShowingSchema == (tab == .schema) && displayedOffset == query.offset
+                let scrollOrigin = tableView.enclosingScrollView?.documentVisibleRect.origin
                 // ページ送りや絞り込みでは列が変わらないので、列幅や並べ替えの表示はそのまま残す
                 let columnsChanged = displayedTable != table || isShowingSchema != (tab == .schema)
-                    || databaseColumns != data.columns
+                    || isShowingQueryResult || databaseColumns != data.columns
                 isShowingSchema = tab == .schema
+                isShowingQueryResult = false
                 displayedTable = table
                 displayedOffset = query.offset
                 totalRowCount = totalCount
@@ -547,9 +660,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 databaseRows = data.rows.enumerated().map { DatabaseRow(order: $0.offset, values: $0.element) }
                 if columnsChanged {
                     rebuildColumns()
+                } else if isShowingSchema {
+                    // スキーマは手元で並べているので、見出しの並べ替えを読み直した行にもかけ直す
+                    sortRows()
                 }
                 tableView.reloadData()
-                if !databaseRows.isEmpty {
+                if keepsScroll, let scrollOrigin {
+                    tableView.scroll(scrollOrigin)
+                } else if !databaseRows.isEmpty {
                     tableView.scrollRowToVisible(0)
                 }
                 updateDataControls()
@@ -574,6 +692,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func showSampleData() {
         isShowingSchema = false
+        isShowingQueryResult = false
         displayedTable = nil
         databaseColumns = nil
         databaseRows = []
@@ -586,7 +705,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     /// DB のテーブルの中身を出しているか（スキーマやサンプルではなく）
     private var isShowingDatabaseData: Bool {
-        databaseColumns != nil && !isShowingSchema
+        databaseColumns != nil && !isShowingSchema && !isShowingQueryResult
     }
 
     /// 絞り込み欄・ページ送り欄の表示と文言を、いまの表示内容に合わせる
@@ -595,6 +714,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         searchField.placeholderString = japanese ? "検索" : "Search"
         previousPageButton.title = japanese ? "前へ" : "Previous"
         nextPageButton.title = japanese ? "次へ" : "Next"
+        runQueryButton.title = japanese ? "実行" : "Run"
+        runQueryButton.toolTip = "⌘↩"
+        runQueryButton.isEnabled = connection != nil && !isRunningQuery
+        sqlBar.isHidden = sidebarTab != .sql
+        updateQueryStatusLabel()
 
         filterBar.isHidden = !isShowingDatabaseData
         pagingBar.isHidden = !isShowingDatabaseData
@@ -662,6 +786,106 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         reloadSelectedTable()
     }
 
+    // MARK: - SQL query
+
+    @objc private func runQueryClicked(_ sender: Any?) {
+        runQuery()
+    }
+
+    /// 入力欄の SQL を読み取り専用で実行し、結果を表に出す
+    private func runQuery() {
+        guard let connection, sidebarTab == .sql, !isRunningQuery else { return }
+        let sql = sqlTextView.string
+        queryGeneration += 1
+        let generation = queryGeneration
+        isRunningQuery = true
+        updateDataControls()
+        let start = Date()
+        Task {
+            do {
+                let result = try await Database.runReadOnlyQuery(sql, on: connection)
+                guard generation == queryGeneration else { return }
+                isRunningQuery = false
+                // 実行中に切断していたら結果は捨てる
+                guard self.connection === connection else {
+                    updateDataControls()
+                    return
+                }
+                lastQueryResult = result
+                lastQueryDuration = Date().timeIntervalSince(start)
+                // 別のタブに移っていたら、SQL タブに戻ったときに出す
+                if sidebarTab == .sql {
+                    showQueryResult()
+                } else {
+                    updateDataControls()
+                }
+            } catch {
+                guard generation == queryGeneration else { return }
+                isRunningQuery = false
+                updateDataControls()
+                let alert = NSAlert()
+                alert.messageText = language == .japanese ? "SQL を実行できませんでした" : "Could not run the SQL"
+                alert.informativeText = queryErrorText(error)
+                alert.beginSheetModal(for: window, completionHandler: nil)
+            }
+        }
+    }
+
+    /// 最後の実行結果を表に出す。まだ実行していなければ空の表にする
+    private func showQueryResult() {
+        isShowingSchema = false
+        isShowingQueryResult = true
+        displayedTable = nil
+        databaseColumns = lastQueryResult?.columns ?? []
+        databaseRows = (lastQueryResult?.rows ?? []).enumerated().map {
+            DatabaseRow(order: $0.offset, values: $0.element)
+        }
+        rebuildColumns()
+        tableView.reloadData()
+        updateDataControls()
+    }
+
+    /// SQL の入力欄が空なら、選んだテーブルを見る SELECT を入れる。書きかけの SQL は消さない
+    private func prefillQueryIfEmpty(for table: TableName) {
+        guard sqlTextView.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        sqlTextView.string = "SELECT * FROM \(table.sqlName) LIMIT 100;"
+    }
+
+    private func updateQueryStatusLabel() {
+        let japanese = language == .japanese
+        if connection == nil {
+            queryStatusLabel.stringValue = japanese ? "DBに接続すると実行できます" : "Connect to DB to run SQL"
+        } else if isRunningQuery {
+            queryStatusLabel.stringValue = japanese ? "実行中…" : "Running…"
+        } else if let lastQueryResult {
+            let count = Self.formatCount(lastQueryResult.rows.count)
+            let seconds = String(format: "%.2f", lastQueryDuration)
+            switch (lastQueryResult.isTruncated, japanese) {
+            case (false, true): queryStatusLabel.stringValue = "\(count) 行（\(seconds) 秒）"
+            case (false, false): queryStatusLabel.stringValue = "\(count) rows (\(seconds) s)"
+            case (true, true): queryStatusLabel.stringValue = "先頭の \(count) 行を表示（\(seconds) 秒）"
+            case (true, false): queryStatusLabel.stringValue = "Showing the first \(count) rows (\(seconds) s)"
+            }
+        } else {
+            queryStatusLabel.stringValue = japanese
+                ? "SELECT・WITH・VALUES・TABLE・EXPLAIN・SHOW を読み取り専用で実行します（⌘↩）"
+                : "Runs SELECT, WITH, VALUES, TABLE, EXPLAIN, and SHOW read-only (⌘↩)"
+        }
+    }
+
+    /// エラーの説明。サーバーのエラーなら、メッセージ・詳細・ヒントだけを見せる
+    private func queryErrorText(_ error: Error) -> String {
+        if case DatabaseError.unsupportedStatement = error {
+            return language == .japanese
+                ? "読み取り専用のため、SELECT・WITH・VALUES・TABLE・EXPLAIN・SHOW で始まる文だけを実行できます。"
+                : "Only statements starting with SELECT, WITH, VALUES, TABLE, EXPLAIN, or SHOW can be run (read-only)."
+        }
+        if let serverInfo = (error as? PSQLError)?.serverInfo, let message = serverInfo[.message] {
+            return [message, serverInfo[.detail], serverInfo[.hint]].compactMap { $0 }.joined(separator: "\n")
+        }
+        return String(reflecting: error)
+    }
+
     // MARK: - Columns and sorting
 
     private func rebuildColumns() {
@@ -683,7 +907,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 tableView.addTableColumn(tableColumn)
             }
             // データタブに戻ったときなど、サーバー側でかけている並べ替えを見出しの矢印に反映する
-            if !isShowingSchema, let sortColumn = dataQuery.sortColumn,
+            if !isShowingSchema, !isShowingQueryResult, let sortColumn = dataQuery.sortColumn,
                let index = databaseColumns.firstIndex(of: sortColumn) {
                 let key = Self.databaseColumnPrefix + String(index)
                 tableView.sortDescriptors = [NSSortDescriptor(key: key, ascending: dataQuery.ascending)]
@@ -792,7 +1016,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard let value = cellValue(row: row, identifier: tableColumn.identifier) else { return }
 
         var title = tableColumn.title
-        if databaseColumns != nil, let selectedTable {
+        if databaseColumns != nil, !isShowingQueryResult, let selectedTable {
             title = "\(selectedTable.displayName).\(title)"
         }
         // ページ送りしているときは、テーブル全体での行番号にする
