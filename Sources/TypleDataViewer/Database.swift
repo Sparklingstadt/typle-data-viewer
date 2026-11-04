@@ -18,9 +18,32 @@ struct TableData: Sendable {
     let rows: [[String?]]
 }
 
+/// データタブの表示条件。列は列名で指定する
+struct TableQuery: Equatable, Sendable {
+    /// 絞り込む列。nil ならすべての列のどれかに一致する行を出す
+    var filterColumn: String?
+    var filterText = ""
+    var sortColumn: String?
+    var ascending = true
+    /// 何行目から表示するか（0 始まり）
+    var offset = 0
+}
+
+/// 1ページ分の行と、絞り込み後の総件数
+struct TablePage: Sendable {
+    let columns: [String]
+    let rows: [[String?]]
+    let totalCount: Int
+}
+
 enum Database {
-    /// 大きなテーブルでも固まらないよう、表示する行数の上限
-    static let rowLimit = 1000
+    /// 大きなテーブルでも固まらないよう、1ページに表示する行数
+    static let pageSize = 1000
+
+    /// 比較演算子がなく ORDER BY できない型。これらは text にして並べる
+    private static let unorderableTypes: Set<String> = [
+        "json", "xml", "point", "line", "lseg", "box", "path", "polygon", "circle",
+    ]
 
     private static let logger = Logger(label: "typle-data-viewer.database")
 
@@ -88,31 +111,67 @@ enum Database {
         return tables
     }
 
-    static func fetchTable(_ table: TableName, on connection: PostgresConnection) async throws -> TableData {
+    /// データタブに出す1ページ分を読む。絞り込み・並べ替え・ページ送りはすべてサーバー側で行う
+    static func fetchTable(_ table: TableName, query: TableQuery, on connection: PostgresConnection) async throws -> TablePage {
         let columnRows = try await connection.query(
             """
-            SELECT column_name FROM information_schema.columns
+            SELECT column_name, data_type FROM information_schema.columns
             WHERE table_schema = \(table.schema) AND table_name = \(table.name)
             ORDER BY ordinal_position
             """,
             logger: logger
         )
         var columns: [String] = []
-        for try await column in columnRows.decode(String.self) {
+        var dataTypes: [String: String] = [:]
+        for try await (column, dataType) in columnRows.decode((String, String).self) {
             columns.append(column)
+            dataTypes[column] = dataType
         }
-        guard !columns.isEmpty else { return TableData(columns: [], rows: []) }
+        guard !columns.isEmpty else { return TablePage(columns: [], rows: [], totalCount: 0) }
+
+        let source = "\(quoteIdentifier(table.schema)).\(quoteIdentifier(table.name))"
+
+        // 検索語は $1 に入れ、どの列とも text にして部分一致（大文字小文字を区別しない）で比べる
+        var whereClause = ""
+        var binds = PostgresBindings()
+        let filterText = query.filterText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !filterText.isEmpty {
+            let targets = query.filterColumn.map { columns.contains($0) ? [$0] : columns } ?? columns
+            let conditions = targets.map { "\(quoteIdentifier($0))::text ILIKE $1" }
+            whereClause = " WHERE " + conditions.joined(separator: " OR ")
+            binds.append("%" + escapeLikePattern(filterText) + "%")
+        }
+
+        // 絞り込み後の件数。ページ送りと「全 N 件」の表示に使う
+        let countQuery = PostgresQuery(unsafeSQL: "SELECT count(*) FROM \(source)\(whereClause)", binds: binds)
+        var totalCount = 0
+        for try await count in try await connection.query(countQuery, logger: logger).decode(Int.self) {
+            totalCount = count
+        }
+
+        // 並べ替えは元の型のまま行うので、数値や日付も正しい順になる。NULL は昇順で先頭、降順で末尾。
+        // 同じ値の行や並べ替えなしのときもページ間で行が重複・欠落しないよう、最後に ctid で順序を固定する
+        var orderTerms: [String] = []
+        if let sortColumn = query.sortColumn, columns.contains(sortColumn) {
+            var expression = quoteIdentifier(sortColumn)
+            if let dataType = dataTypes[sortColumn], unorderableTypes.contains(dataType) {
+                expression += "::text"
+            }
+            orderTerms.append(expression + (query.ascending ? " ASC NULLS FIRST" : " DESC NULLS LAST"))
+        }
+        orderTerms.append("ctid")
 
         // 型ごとのデコードを避けるため、全列をサーバー側で text に変換して受け取る
         let selectList = columns.map { "\(quoteIdentifier($0))::text" }.joined(separator: ", ")
-        let source = "\(quoteIdentifier(table.schema)).\(quoteIdentifier(table.name))"
-        let query = PostgresQuery(unsafeSQL: "SELECT \(selectList) FROM \(source) LIMIT \(rowLimit)")
+        let offset = max(0, query.offset)
+        let sql = "SELECT \(selectList) FROM \(source)\(whereClause)"
+            + " ORDER BY \(orderTerms.joined(separator: ", ")) LIMIT \(pageSize) OFFSET \(offset)"
 
         var rows: [[String?]] = []
-        for try await row in try await connection.query(query, logger: logger) {
+        for try await row in try await connection.query(PostgresQuery(unsafeSQL: sql, binds: binds), logger: logger) {
             rows.append(try row.map { try $0.decode(String?.self) })
         }
-        return TableData(columns: columns, rows: rows)
+        return TablePage(columns: columns, rows: rows, totalCount: totalCount)
     }
 
     /// テーブルの列ごとの名前・型・NOT NULL・既定値。型は integer[] や varchar(255) のように SQL の表記で返す
@@ -133,6 +192,18 @@ enum Database {
             columns.append([name, type, notNull ? "NOT NULL" : "", defaultValue])
         }
         return columns
+    }
+
+    /// LIKE の特殊文字（% と _）を文字どおりに扱うよう、既定のエスケープ文字 \ を前に付ける
+    private static func escapeLikePattern(_ text: String) -> String {
+        var escaped = ""
+        for character in text {
+            if character == "\\" || character == "%" || character == "_" {
+                escaped.append("\\")
+            }
+            escaped.append(character)
+        }
+        return escaped
     }
 
     private static func quoteIdentifier(_ identifier: String) -> String {
