@@ -41,7 +41,43 @@ struct ContentView: View {
             .labelsHidden()
             .fixedSize()
             .padding(8)
-            Spacer()
+            switch model.tab {
+            case .data: dataTab
+            case .schema, .sql: Spacer()
+            }
+        }
+    }
+
+    private var dataTab: some View {
+        VStack(spacing: 0) {
+            HStack {
+                TextField("検索", text: $model.query.filterText)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { model.applyFilter() }
+                Picker("絞り込む列", selection: $model.query.filterColumn) {
+                    Text("すべての列").tag(String?.none)
+                    ForEach(model.gridColumns) { Text($0.name).tag(String?.some($0.name)) }
+                }
+                .labelsHidden()
+                .fixedSize()
+                .onChange(of: model.query.filterColumn) { model.applyFilter() }
+            }
+            .padding(.horizontal, 8)
+            .padding(.bottom, 8)
+            DataGrid(
+                columns: model.gridColumns,
+                rows: model.gridRows,
+                numericColumns: model.numericColumns,
+                sortOrder: Binding(get: { model.dataSort }, set: { model.sortData(by: $0) })
+            )
+            HStack {
+                Text(GridLogic.rangeText(offset: model.query.offset, shown: model.gridRows.count, total: model.totalCount))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("前へ") { model.previousPage() }.disabled(!model.hasPreviousPage)
+                Button("次へ") { model.nextPage() }.disabled(!model.hasNextPage)
+            }
+            .padding(8)
         }
     }
 

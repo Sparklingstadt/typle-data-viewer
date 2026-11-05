@@ -17,5 +17,12 @@ struct TypleDataViewerApp: App {
                 .frame(minWidth: 800, minHeight: 500)
                 .onAppear { NSApplication.shared.activate(ignoringOtherApps: true) }
         }
+        .commands {
+            CommandGroup(before: .toolbar) {
+                Button("再読み込み") { model.reload() }
+                    .keyboardShortcut("r")
+                    .disabled(model.connection == nil)
+            }
+        }
     }
 }

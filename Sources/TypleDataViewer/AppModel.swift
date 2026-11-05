@@ -56,6 +56,18 @@ final class AppModel {
     var tab: ContentTab = .data
     var alert: AppAlert?
 
+    /// データタブの表示条件。絞り込みの入力欄と列の選択はここへ直接書く
+    var query = TableQuery()
+    private(set) var dataSort: [GridSort] = []
+    private(set) var gridColumns: [GridColumn] = []
+    private(set) var gridRows: [GridRow] = []
+    private(set) var numericColumns: Set<Int> = []
+    private(set) var totalCount = 0
+    /// いま query が対象にしているテーブル。別のテーブルに移ったら条件を初期状態に戻す
+    private var queryTable: TableName?
+    /// 読み込みのたびに増やす。完了時に番号が古ければ結果を捨てる
+    private var loadGeneration = 0
+
     func toggleConnection() {
         if connection == nil { connect() } else { disconnect() }
     }
@@ -118,9 +130,90 @@ final class AppModel {
         tables = []
         tableKinds = [:]
         selectedTable = nil
+        loadGeneration += 1
+        clearDisplayedTable()
         connectionState = .disconnected
         Task { try? await connection.close() }
     }
 
-    func selectionDidChange() {}
+    func selectionDidChange() {
+        guard selectedTable != queryTable else { return }
+        queryTable = selectedTable
+        query = TableQuery()
+        dataSort = []
+        loadSelected()
+    }
+
+    /// 選択中のテーブルを、いまの条件で読む
+    func loadSelected() {
+        guard let connection, let table = selectedTable else { return }
+        let query = query
+        let kind = tableKinds[table] ?? .table
+        loadGeneration += 1
+        let generation = loadGeneration
+        Task {
+            do {
+                let page = try await Database.fetchTable(table, kind: kind, query: query, on: connection)
+                // 読み込み中に別のテーブルや条件が選ばれていたら、古い結果は捨てる
+                guard generation == loadGeneration else { return }
+                // 再読み込みで行が減り、いまのページが範囲外になったら最後のページを読み直す
+                if page.rows.isEmpty, query.offset > 0, page.totalCount > 0 {
+                    self.query.offset = GridLogic.lastPageOffset(totalCount: page.totalCount, pageSize: Database.pageSize)
+                    loadSelected()
+                    return
+                }
+                gridColumns = GridLogic.columns(page.columns)
+                gridRows = GridLogic.rows(page.rows)
+                numericColumns = page.numericColumns
+                totalCount = page.totalCount
+            } catch {
+                guard generation == loadGeneration else { return }
+                alert = AppAlert(title: "テーブル「\(table.displayName)」を読み込めませんでした", message: String(reflecting: error))
+            }
+        }
+    }
+
+    func reload() {
+        loadSelected()
+    }
+
+    func applyFilter() {
+        query.offset = 0
+        loadSelected()
+    }
+
+    /// 見出しのクリックで呼ばれる。データタブの並べ替えは DB に任せる
+    func sortData(by order: [GridSort]) {
+        dataSort = order
+        guard let sort = order.first, gridColumns.indices.contains(sort.column) else { return }
+        query.sortColumn = gridColumns[sort.column].name
+        query.ascending = sort.order == .forward
+        query.offset = 0
+        loadSelected()
+    }
+
+    var hasNextPage: Bool { query.offset + gridRows.count < totalCount }
+    var hasPreviousPage: Bool { query.offset > 0 }
+
+    func nextPage() {
+        guard hasNextPage else { return }
+        query.offset += Database.pageSize
+        loadSelected()
+    }
+
+    func previousPage() {
+        guard hasPreviousPage else { return }
+        query.offset = max(0, query.offset - Database.pageSize)
+        loadSelected()
+    }
+
+    private func clearDisplayedTable() {
+        queryTable = nil
+        query = TableQuery()
+        dataSort = []
+        gridColumns = []
+        gridRows = []
+        numericColumns = []
+        totalCount = 0
+    }
 }
