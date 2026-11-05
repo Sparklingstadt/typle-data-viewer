@@ -7,7 +7,7 @@ let infoPlistPath = Context.packageDirectory + "/Supporting/Info.plist"
 
 let package = Package(
     name: "TypleDataViewer",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS("14.4")],
     dependencies: [
         .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.21.0"),
     ],
