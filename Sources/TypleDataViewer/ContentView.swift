@@ -88,7 +88,7 @@ struct ContentView: View {
                     ForEach(model.gridColumns) { Text($0.name).tag(String?.some($0.name)) }
                 }
                 .labelsHidden()
-                .fixedSize()
+                .frame(width: 160)
                 .onChange(of: model.query.filterColumn) { model.applyFilter() }
             }
             .padding(.horizontal, 8)
@@ -123,6 +123,8 @@ struct ContentView: View {
                     Text(profile.name).tag(ConnectionTarget.profile(profile.id).key)
                 }
             }
+            .labelsHidden()
+            .frame(width: 160)
             .disabled(model.connectionState.isConnecting)
             Button(model.connectionState.buttonTitle) { model.toggleConnection() }
                 .disabled(model.connectionState.isConnecting)
