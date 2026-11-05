@@ -63,10 +63,12 @@ final class AppModel {
     private(set) var gridRows: [GridRow] = []
     private(set) var numericColumns: Set<Int> = []
     private(set) var totalCount = 0
+    /// いま表に出ているページの先頭。query.offset は読み込み中の次のページを指すことがある
+    private(set) var displayedOffset = 0
     /// いま query が対象にしているテーブル。別のテーブルに移ったら条件を初期状態に戻す
     private var queryTable: TableName?
     /// 読み込みのたびに増やす。完了時に番号が古ければ結果を捨てる
-    private var loadGeneration = 0
+    private(set) var loadGeneration = 0
 
     private(set) var schema: TableSchema?
     private(set) var schemaRows: [GridRow] = []
@@ -158,6 +160,8 @@ final class AppModel {
 
     func selectionDidChange() {
         guard selectedTable != queryTable else { return }
+        // SQL タブでは読み込みが走らないので、ここで前のテーブルの読み込み結果を無効にする
+        loadGeneration += 1
         queryTable = selectedTable
         query = TableQuery()
         dataSort = []
@@ -196,6 +200,7 @@ final class AppModel {
                 }
                 gridColumns = GridLogic.columns(page.columns)
                 gridRows = GridLogic.rows(page.rows)
+                displayedOffset = query.offset
                 numericColumns = page.numericColumns
                 totalCount = page.totalCount
             } catch {
@@ -287,18 +292,18 @@ final class AppModel {
         loadSelected()
     }
 
-    var hasNextPage: Bool { query.offset + gridRows.count < totalCount }
-    var hasPreviousPage: Bool { query.offset > 0 }
+    var hasNextPage: Bool { displayedOffset + gridRows.count < totalCount }
+    var hasPreviousPage: Bool { displayedOffset > 0 }
 
     func nextPage() {
         guard hasNextPage else { return }
-        query.offset += Database.pageSize
+        query.offset = displayedOffset + Database.pageSize
         loadSelected()
     }
 
     func previousPage() {
         guard hasPreviousPage else { return }
-        query.offset = max(0, query.offset - Database.pageSize)
+        query.offset = max(0, displayedOffset - Database.pageSize)
         loadSelected()
     }
 
@@ -308,6 +313,7 @@ final class AppModel {
         dataSort = []
         gridColumns = []
         gridRows = []
+        displayedOffset = 0
         numericColumns = []
         totalCount = 0
         schema = nil

@@ -100,7 +100,7 @@ struct ContentView: View {
                 sortOrder: Binding(get: { model.dataSort }, set: { model.sortData(by: $0) })
             )
             HStack {
-                Text(GridLogic.rangeText(offset: model.query.offset, shown: model.gridRows.count, total: model.totalCount))
+                Text(GridLogic.rangeText(offset: model.displayedOffset, shown: model.gridRows.count, total: model.totalCount))
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("前へ") { model.previousPage() }.disabled(!model.hasPreviousPage)
