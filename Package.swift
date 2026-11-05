@@ -25,6 +25,10 @@ let package = Package(
                     "-Xlinker", infoPlistPath,
                 ])
             ]
-        )
+        ),
+        .testTarget(
+            name: "TypleDataViewerTests",
+            dependencies: ["TypleDataViewer"]
+        ),
     ]
 )
