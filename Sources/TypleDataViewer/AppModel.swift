@@ -68,6 +68,26 @@ final class AppModel {
     /// 読み込みのたびに増やす。完了時に番号が古ければ結果を捨てる
     private var loadGeneration = 0
 
+    private(set) var schema: TableSchema?
+    private(set) var schemaRows: [GridRow] = []
+    let schemaColumns = GridLogic.columns(["列名", "型", "NOT NULL", "既定値", "キー"])
+    /// スキーマは手元で並べ替える
+    var schemaSort: [GridSort] = [] {
+        didSet { schemaRows = schemaRows.sorted(using: schemaSort) }
+    }
+
+    var sqlText = ""
+    private(set) var isRunningQuery = false
+    private(set) var queryResult: QueryResult?
+    private(set) var queryDuration: TimeInterval = 0
+    private(set) var queryColumns: [GridColumn] = []
+    private(set) var queryRows: [GridRow] = []
+    /// SQL の結果は手元で並べ替える
+    var querySort: [GridSort] = [] {
+        didSet { queryRows = queryRows.sorted(using: querySort) }
+    }
+    private var queryGeneration = 0
+
     func toggleConnection() {
         if connection == nil { connect() } else { disconnect() }
     }
@@ -147,6 +167,18 @@ final class AppModel {
     /// 選択中のテーブルを、いまの条件で読む
     func loadSelected() {
         guard let connection, let table = selectedTable else { return }
+        switch tab {
+        case .data: loadData(table, on: connection)
+        case .schema: loadSchema(table, on: connection)
+        case .sql:
+            // SQL タブではテーブルを読まない。入力欄が空なら、そのテーブルを見る SELECT を入れておく
+            if sqlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                sqlText = GridLogic.defaultSelect(for: table)
+            }
+        }
+    }
+
+    private func loadData(_ table: TableName, on connection: PostgresConnection) {
         let query = query
         let kind = tableKinds[table] ?? .table
         loadGeneration += 1
@@ -173,8 +205,71 @@ final class AppModel {
         }
     }
 
+    private func loadSchema(_ table: TableName, on connection: PostgresConnection) {
+        loadGeneration += 1
+        let generation = loadGeneration
+        Task {
+            do {
+                let fetched = try await Database.fetchSchema(table, on: connection)
+                guard generation == loadGeneration else { return }
+                schema = fetched
+                schemaRows = GridLogic.rows(fetched.columns).sorted(using: schemaSort)
+            } catch {
+                guard generation == loadGeneration else { return }
+                alert = AppAlert(title: "テーブル「\(table.displayName)」を読み込めませんでした", message: String(reflecting: error))
+            }
+        }
+    }
+
     func reload() {
         loadSelected()
+    }
+
+    func runQuery() {
+        guard let connection, !isRunningQuery else { return }
+        let sql = sqlText
+        queryGeneration += 1
+        let generation = queryGeneration
+        isRunningQuery = true
+        let start = Date()
+        Task {
+            do {
+                let result = try await Database.runReadOnlyQuery(sql, on: connection)
+                guard generation == queryGeneration else { return }
+                isRunningQuery = false
+                // 実行中に切断していたら結果は捨てる
+                guard self.connection === connection else { return }
+                queryDuration = Date().timeIntervalSince(start)
+                queryResult = result
+                queryColumns = GridLogic.columns(result.columns)
+                querySort = []
+                queryRows = GridLogic.rows(result.rows)
+            } catch {
+                guard generation == queryGeneration else { return }
+                isRunningQuery = false
+                alert = AppAlert(title: "SQL を実行できませんでした", message: Self.queryErrorText(error))
+            }
+        }
+    }
+
+    var queryStatusText: String {
+        if connection == nil { return "DBに接続すると実行できます" }
+        if isRunningQuery { return "実行中…" }
+        guard let queryResult else { return "SELECT・WITH・VALUES・TABLE・EXPLAIN・SHOW を読み取り専用で実行します（⌘↩）" }
+        return GridLogic.queryStatusText(
+            rowCount: queryResult.rows.count, seconds: queryDuration, isTruncated: queryResult.isTruncated
+        )
+    }
+
+    /// エラーの説明。サーバーのエラーなら、メッセージ・詳細・ヒントだけを見せる
+    private static func queryErrorText(_ error: Error) -> String {
+        if case DatabaseError.unsupportedStatement = error {
+            return "読み取り専用のため、SELECT・WITH・VALUES・TABLE・EXPLAIN・SHOW で始まる文だけを実行できます。"
+        }
+        if let serverInfo = (error as? PSQLError)?.serverInfo, let message = serverInfo[.message] {
+            return [message, serverInfo[.detail], serverInfo[.hint]].compactMap { $0 }.joined(separator: "\n")
+        }
+        return String(reflecting: error)
     }
 
     func applyFilter() {
@@ -215,5 +310,12 @@ final class AppModel {
         gridRows = []
         numericColumns = []
         totalCount = 0
+        schema = nil
+        schemaRows = []
+        schemaSort = []
+        queryResult = nil
+        queryColumns = []
+        queryRows = []
+        querySort = []
     }
 }

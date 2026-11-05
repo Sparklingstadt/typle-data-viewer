@@ -11,6 +11,7 @@ struct ContentView: View {
         }
         .toolbar { toolbar }
         .onChange(of: model.selectedTable) { model.selectionDidChange() }
+        .onChange(of: model.tab) { model.loadSelected() }
         .alert(
             model.alert?.title ?? "",
             isPresented: Binding(get: { model.alert != nil }, set: { if !$0 { model.alert = nil } }),
@@ -43,9 +44,37 @@ struct ContentView: View {
             .padding(8)
             switch model.tab {
             case .data: dataTab
-            case .schema, .sql: Spacer()
+            case .schema: schemaTab
+            case .sql: SQLView(model: model)
             }
         }
+    }
+
+    private var schemaTab: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let schema = model.schema {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(schemaSummary(schema))
+                    Text(schema.indexes.isEmpty ? "インデックスなし" : schema.indexes.joined(separator: "\n"))
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.bottom, 8)
+            }
+            DataGrid(
+                columns: model.schema == nil ? [] : model.schemaColumns,
+                rows: model.schemaRows,
+                numericColumns: [],
+                sortOrder: $model.schemaSort
+            )
+        }
+    }
+
+    private func schemaSummary(_ schema: TableSchema) -> String {
+        let rowCount = schema.estimatedRowCount.map(GridLogic.formatCount) ?? "不明"
+        return "推定 \(rowCount) 行 · データ \(schema.tableSize) · インデックス等を含め \(schema.totalSize)"
     }
 
     private var dataTab: some View {
